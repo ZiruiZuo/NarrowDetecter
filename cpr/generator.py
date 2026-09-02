@@ -371,6 +371,12 @@ def generate_stretched_cpr(
         cval=cval,
         prefilter=interpolation_order > 1,
     )
+    valid_sampling_line = np.abs(line_parameters) <= radius_mm + 1e-8
+    stretched_image = np.where(
+        valid_sampling_line,
+        stretched_image,
+        cval,
+    )
 
     label = str(name) or "centerline"
     return CPRResult(
