@@ -12,7 +12,11 @@ try:
         generate_stretched_cpr,
     )
     from .models import DetectorConfig
-    from .myio import read_mask_like, read_nifti_pair
+    from .io import (
+        read_mask_like,
+        read_nifti_pair,
+        read_stenosis_candidates,
+    )
     from .visualization import write_cpr_result
 except ImportError:
     from cpr import (
@@ -22,7 +26,11 @@ except ImportError:
         generate_stretched_cpr,
     )
     from models import DetectorConfig
-    from myio import read_mask_like, read_nifti_pair
+    from io import (
+        read_mask_like,
+        read_nifti_pair,
+        read_stenosis_candidates,
+    )
     from visualization import write_cpr_result
 
 
@@ -51,6 +59,7 @@ def run_cpr(
     min_branch_length_mm: float = 3.0,
     min_branch_mean_radius_mm: float = 0.4,
     max_branch_order: Optional[int] = None,
+    stenosis_result_path: Optional[str] = None,
 ) -> list[CPRResult]:
     """Generate CPR from either an ordered centerline or a vessel label."""
     if (centerline_voxel_zyx is None) == (label_path is None):
@@ -170,14 +179,27 @@ def run_cpr(
                 )
             cpr_results.append(cpr)
 
+    candidates_by_branch = (
+        read_stenosis_candidates(stenosis_result_path)
+        if stenosis_result_path is not None
+        else {}
+    )
     if save_outputs:
         for cpr in cpr_results:
-            write_cpr_result(cpr, output_dir)
+            write_cpr_result(
+                cpr,
+                output_dir,
+                candidates=candidates_by_branch.get(cpr.branch_id, ()),
+            )
     if print_summary:
         for cpr in cpr_results:
+            candidate_count = len(
+                candidates_by_branch.get(cpr.branch_id, ())
+            )
             print(
                 f"{cpr.anatomical_label}: phi={cpr.angle_degrees:g} deg, "
-                f"shape={cpr.image.shape}"
+                f"shape={cpr.image.shape}, "
+                f"stenosis_marks={candidate_count}"
             )
     return cpr_results
 

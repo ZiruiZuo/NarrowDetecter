@@ -5,12 +5,16 @@ from typing import Optional
 try:
     from .detection import detect_coronary_stenosis
     from .models import DetectionResult, DetectorConfig
-    from .myio import read_mask_like, read_nifti_pair, write_results
+    from .io import (
+        read_mask_like,
+        read_nifti_pair,
+        write_detection_result,
+    )
     from .visualization import write_visualizations
 except ImportError:
     from detection import detect_coronary_stenosis
     from models import DetectionResult, DetectorConfig
-    from myio import read_mask_like, read_nifti_pair, write_results
+    from io import read_mask_like, read_nifti_pair, write_detection_result
     from visualization import write_visualizations
 
 
@@ -71,7 +75,7 @@ def run_detection(
         config,
         aorta_mask=aorta_mask,
     )
-    write_results(result, output_dir)
+    write_detection_result(result, output_dir)
     if save_visualizations:
         write_visualizations(
             result=result,
