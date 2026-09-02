@@ -4,34 +4,15 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 
-try:
-    from .cpr import (
-        CPRResult,
-        generate_centerline_cpr,
-        generate_label_cprs,
-        generate_stretched_cpr,
-    )
-    from .models import DetectorConfig
-    from .io import (
-        read_mask_like,
-        read_nifti_pair,
-        read_stenosis_candidates,
-    )
-    from .visualization import write_cpr_result
-except ImportError:
-    from cpr import (
-        CPRResult,
-        generate_centerline_cpr,
-        generate_label_cprs,
-        generate_stretched_cpr,
-    )
-    from models import DetectorConfig
-    from io import (
-        read_mask_like,
-        read_nifti_pair,
-        read_stenosis_candidates,
-    )
-    from visualization import write_cpr_result
+from ..cpr import (
+    CPRResult,
+    generate_centerline_cpr,
+    generate_label_cprs,
+    generate_stretched_cpr,
+)
+from ..io import read_mask_like, read_nifti_pair, read_stenosis_candidates
+from ..models import DetectorConfig
+from ..visualization import write_cpr_result
 
 
 def run_cpr(
@@ -202,25 +183,3 @@ def run_cpr(
                 f"stenosis_marks={candidate_count}"
             )
     return cpr_results
-
-
-main = run_cpr
-
-if __name__ == "__main__":
-    cpr_results = run_cpr(
-        image_path=r"E:\ZZR\Data\temp\water_0806.nii",
-        label_path=r"E:\ZZR\Data\DataTest\ForModel\FinedPred\50\coronary_050.nii.gz",
-        output_dir=r"E:\ZZR\Data\DataTest\ForModel\FinedPred\50\cpr_result",
-        label_values={
-            "LAD": 2,
-            "LCX": 3,
-            "RCA": 4,
-        },
-        aorta_mask_path=r"E:\ZZR\Data\DataTest\ForModel\FinedPred\50\coronary_050_seg.nii.gz",
-        angles_degrees=(10, 20, 30, 45, 60, 70, 80),
-        mode="straightened",
-        curve_resolution_mm=0.5,
-        slice_resolution_mm=0.5,
-        sampling_line_length_mm=50.0,
-        analyze_side_branches=False,
-    )
