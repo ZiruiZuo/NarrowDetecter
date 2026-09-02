@@ -1,6 +1,6 @@
 """Coronary lumen stenosis screening and CPR generation."""
 
-from .api import run_cpr, run_detection
+from .api import run_combined, run_cpr, run_detection
 from .models import (
     CPRConfig,
     CPRResult,
@@ -15,6 +15,7 @@ __all__ = [
     "CombinedResult",
     "DetectionResult",
     "DetectorConfig",
+    "run_combined",
     "run_cpr",
     "run_detection",
 ]
