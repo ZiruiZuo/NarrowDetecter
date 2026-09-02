@@ -7,7 +7,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 try:
-    from .models import BranchResult, CPRResult
+    from ..models import BranchResult, CPRConfig, CPRResult
 except ImportError:
     from models import BranchResult, CPRResult
 
@@ -138,7 +138,7 @@ def _prepare_centerline_geometry(
                 "Explicit distances cannot be combined with centerline resampling."
             )
         try:
-            from .centerline import smooth_and_resample_centerline
+            from ..centerline import smooth_and_resample_centerline
         except ImportError:
             from centerline import smooth_and_resample_centerline
 
@@ -153,7 +153,7 @@ def _prepare_centerline_geometry(
         raise ValueError("frames_u_zyx and frames_v_zyx must be supplied together.")
     if frames_u_zyx is None:
         try:
-            from .centerline import tangents_and_frames
+            from ..centerline import tangents_and_frames
         except ImportError:
             from centerline import tangents_and_frames
 
@@ -417,8 +417,8 @@ def generate_label_cprs(
     image_direction_xyz: Sequence[float] | np.ndarray | None = None,
 ) -> list[CPRResult]:
     """Extract centerline trees from a label and generate CPR images."""
-    from .centerline import extract_centerline_tree
-    from .centerline.anatomy import (
+    from ..centerline import extract_centerline_tree
+    from ..centerline.anatomy import (
         build_anatomical_plan,
         point_anatomical_label,
     )
@@ -585,3 +585,169 @@ def generate_branch_cpr(
             item.anatomical_label for item in branch.measurements
         ),
     )
+
+
+def _resample_branch_measurements(
+    branch: BranchResult,
+    step_mm: float,
+    spacing_zyx: Sequence[float],
+):
+    """Interpolate stored branch geometry without re-extracting its tree."""
+    if len(branch.measurements) < 2:
+        raise ValueError(
+            f"Branch {branch.branch_id} needs at least two measurements."
+        )
+    if not np.isfinite(step_mm) or step_mm <= 0:
+        raise ValueError("curve_resolution_mm must be positive and finite.")
+    if any(
+        item.frame_u_zyx is None or item.frame_v_zyx is None
+        for item in branch.measurements
+    ):
+        raise ValueError(
+            f"Branch {branch.branch_id} does not contain complete CPR frames."
+        )
+    old_s = np.asarray(
+        [item.distance_mm for item in branch.measurements],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(old_s)) or np.any(np.diff(old_s) <= 0):
+        raise ValueError(
+            f"Branch {branch.branch_id} distances must be finite and increasing."
+        )
+    old_s = old_s - old_s[0]
+    new_s = np.arange(0.0, old_s[-1], float(step_mm), dtype=float)
+    new_s = np.unique(np.concatenate((new_s, [old_s[-1]])))
+    centers = np.column_stack(
+        [
+            np.interp(
+                new_s,
+                old_s,
+                [item.center_voxel_zyx[axis] for item in branch.measurements],
+            )
+            for axis in range(3)
+        ]
+    )
+    interpolated_u = np.column_stack(
+        [
+            np.interp(
+                new_s,
+                old_s,
+                [item.frame_u_zyx[axis] for item in branch.measurements],
+            )
+            for axis in range(3)
+        ]
+    )
+    interpolated_v = np.column_stack(
+        [
+            np.interp(
+                new_s,
+                old_s,
+                [item.frame_v_zyx[axis] for item in branch.measurements],
+            )
+            for axis in range(3)
+        ]
+    )
+    spacing = np.asarray(spacing_zyx, dtype=float)
+    if spacing.shape != (3,) or np.any(~np.isfinite(spacing)) or np.any(spacing <= 0):
+        raise ValueError("spacing_zyx must contain three positive values.")
+    centers_mm = centers * spacing
+    tangents = np.gradient(centers_mm, new_s, axis=0)
+    tangent_norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+    if np.any(tangent_norms < 1e-8):
+        raise ValueError(f"Branch {branch.branch_id} has a zero-length tangent.")
+    tangents /= tangent_norms
+    frames_u = interpolated_u - (
+        np.sum(interpolated_u * tangents, axis=1, keepdims=True)
+        * tangents
+    )
+    frame_u_norms = np.linalg.norm(frames_u, axis=1, keepdims=True)
+    if np.any(frame_u_norms < 1e-8):
+        raise ValueError(f"Branch {branch.branch_id} has a degenerate CPR frame.")
+    frames_u /= frame_u_norms
+    frames_v = np.cross(tangents, frames_u)
+    flip = np.sum(frames_v * interpolated_v, axis=1) < 0
+    frames_u[flip] *= -1.0
+    frames_v[flip] *= -1.0
+    return centers, frames_u, frames_v, new_s, tangents
+
+
+def _nearest_measurement_labels(
+    branch: BranchResult,
+    distances_mm: np.ndarray,
+) -> Tuple[str, ...]:
+    old_s = np.asarray(
+        [item.distance_mm for item in branch.measurements],
+        dtype=float,
+    )
+    old_s = old_s - old_s[0]
+    right = np.searchsorted(old_s, distances_mm, side="left")
+    right = np.clip(right, 0, len(old_s) - 1)
+    left = np.maximum(right - 1, 0)
+    choose_left = (
+        np.abs(distances_mm - old_s[left])
+        <= np.abs(old_s[right] - distances_mm)
+    )
+    indices = np.where(choose_left, left, right)
+    return tuple(
+        branch.measurements[int(index)].anatomical_label
+        or branch.anatomical_label
+        for index in indices
+    )
+
+
+def generate_branch_cprs(
+    image: np.ndarray,
+    spacing_zyx: Sequence[float],
+    branch: BranchResult,
+    config: CPRConfig,
+    image_direction_xyz: Sequence[float] | np.ndarray | None = None,
+) -> list[CPRResult]:
+    """Generate all requested CPRs directly from detection measurements."""
+    config.validate()
+    centers, frames_u, frames_v, distances, _ = (
+        _resample_branch_measurements(
+            branch,
+            step_mm=config.curve_resolution_mm,
+            spacing_zyx=spacing_zyx,
+        )
+    )
+    first_root_distance = float(
+        branch.measurements[0].distance_from_root_mm
+    )
+    point_labels = _nearest_measurement_labels(branch, distances)
+    results = []
+    for angle in (float(value) for value in config.angles_degrees):
+        common = dict(
+            image=image,
+            centerline_voxel_zyx=centers,
+            spacing_zyx=spacing_zyx,
+            angle_degrees=angle,
+            frames_u_zyx=frames_u,
+            frames_v_zyx=frames_v,
+            centerline_distances_mm=distances,
+            distance_from_root_mm=first_root_distance,
+            interpolation_order=config.interpolation_order,
+            name=branch.anatomical_label or branch.branch_id,
+        )
+        if config.mode.lower() == "straightened":
+            cpr = generate_centerline_cpr(
+                **common,
+                radius_mm=0.5 * config.sampling_line_length_mm,
+                pixel_mm=config.slice_resolution_mm,
+            )
+        else:
+            cpr = generate_stretched_cpr(
+                **common,
+                sampling_line_length_mm=config.sampling_line_length_mm,
+                slice_resolution_mm=config.slice_resolution_mm,
+                image_direction_xyz=image_direction_xyz,
+            )
+        results.append(
+            replace(
+                cpr,
+                branch_id=branch.branch_id,
+                anatomical_label=branch.anatomical_label or branch.branch_id,
+                point_anatomical_labels=point_labels,
+            )
+        )
+    return results
