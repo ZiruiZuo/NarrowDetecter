@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-try:
-    from .centerline import CenterlineBranch
-except ImportError:
-    from centerline import CenterlineBranch
+from .extraction import CenterlineBranch
 
 
 def build_anatomical_plan(

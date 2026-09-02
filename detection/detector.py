@@ -5,52 +5,28 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy import ndimage as ndi
 
-try:
-    from .anatomy import (
-        build_anatomical_plan as _build_anatomical_plan,
-        point_anatomical_label as _point_anatomical_label,
-    )
-    from .centerline import (
-        CenterlineBranch,
-        extract_centerline_tree,
-        tangents_and_frames,
-    )
-    from .cross_section import (
-        make_sampling_grid,
-        sample_plane,
-        segment_cross_section,
-    )
-    from .models import (
-        BranchResult,
-        CrossSectionMeasurement,
-        DetectionResult,
-        DetectorConfig,
-        StenosisCandidate,
-        VesselResult,
-    )
-except ImportError:
-    from anatomy import (
-        build_anatomical_plan as _build_anatomical_plan,
-        point_anatomical_label as _point_anatomical_label,
-    )
-    from centerline import (
-        CenterlineBranch,
-        extract_centerline_tree,
-        tangents_and_frames,
-    )
-    from cross_section import (
-        make_sampling_grid,
-        sample_plane,
-        segment_cross_section,
-    )
-    from models import (
-        BranchResult,
-        CrossSectionMeasurement,
-        DetectionResult,
-        DetectorConfig,
-        StenosisCandidate,
-        VesselResult,
-    )
+from ..centerline import (
+    CenterlineBranch,
+    extract_centerline_tree,
+    tangents_and_frames,
+)
+from ..centerline.anatomy import (
+    build_anatomical_plan as _build_anatomical_plan,
+    point_anatomical_label as _point_anatomical_label,
+)
+from ..models import (
+    BranchResult,
+    CrossSectionMeasurement,
+    DetectionResult,
+    DetectorConfig,
+    StenosisCandidate,
+    VesselResult,
+)
+from .cross_section import (
+    make_sampling_grid,
+    sample_plane,
+    segment_cross_section,
+)
 
 
 def _validate_inputs(
@@ -126,6 +102,17 @@ def _smooth_valid_profile(
     return filled
 
 
+def _mean_region_intensity(
+    image_plane: np.ndarray,
+    region: np.ndarray,
+) -> Optional[float]:
+    values = np.asarray(image_plane, dtype=float)[np.asarray(region, dtype=bool)]
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    return float(np.mean(values))
+
+
 def _estimate_reference(
     diameters: np.ndarray,
     distances: np.ndarray,
@@ -172,6 +159,54 @@ def _estimate_reference(
         reference = ndi.gaussian_filter1d(
             reference, sigma=sigma, mode="nearest"
         )
+    return reference
+
+
+def _estimate_signal_reference(
+    mean_intensities: np.ndarray,
+    distances: np.ndarray,
+    usable: np.ndarray,
+    config: DetectorConfig,
+) -> np.ndarray:
+    reference = np.full_like(mean_intensities, np.nan, dtype=float)
+    half_window = config.reference_window_mm / 2.0
+    for index, distance in enumerate(distances):
+        delta = np.abs(distances - distance)
+        selection = (
+            usable
+            & (delta <= half_window)
+            & (delta >= config.reference_exclusion_mm)
+            & np.isfinite(mean_intensities)
+        )
+        values = mean_intensities[selection]
+        if values.size < 3:
+            selection = (
+                usable
+                & (delta <= half_window)
+                & np.isfinite(mean_intensities)
+            )
+            values = mean_intensities[selection]
+        if values.size:
+            reference[index] = float(np.median(values))
+
+    valid = np.isfinite(reference)
+    if np.count_nonzero(valid) >= 2:
+        reference = np.interp(
+            np.arange(len(reference)),
+            np.flatnonzero(valid),
+            reference[valid],
+        )
+        sigma = max(
+            config.profile_smoothing_mm
+            / config.centerline_step_mm,
+            0.0,
+        )
+        if sigma > 0:
+            reference = ndi.gaussian_filter1d(
+                reference,
+                sigma=sigma,
+                mode="nearest",
+            )
     return reference
 
 
@@ -400,7 +435,7 @@ def _measure_branch(
         allowed_plane &= (
             radial_distance <= config.cross_section_radius_mm
         )
-        _, area, prior_area, quality, flags = segment_cross_section(
+        region, area, prior_area, quality, flags = segment_cross_section(
             image_plane,
             gradient_plane,
             prior_plane,
@@ -408,6 +443,12 @@ def _measure_branch(
             radial_distance,
             config,
         )
+        mean_lumen_intensity = _mean_region_intensity(
+            image_plane,
+            region,
+        )
+        if mean_lumen_intensity is None:
+            flags.append("empty_signal_region")
 
         near_start_endpoint = (
             tree_branch.starts_at_endpoint
@@ -445,6 +486,7 @@ def _measure_branch(
                 area_mm2=area,
                 equivalent_diameter_mm=diameter,
                 prior_area_mm2=prior_area,
+                mean_lumen_intensity=mean_lumen_intensity,
                 branch_id=branch_id,
                 branch_index=tree_branch.branch_id,
                 distance_from_root_mm=distance_from_root,
@@ -498,6 +540,21 @@ def _measure_branch(
     reference = _estimate_reference(
         smoothed, distances, usable, config
     )
+    mean_intensities = np.asarray(
+        [
+            np.nan
+            if measurement.mean_lumen_intensity is None
+            else measurement.mean_lumen_intensity
+            for measurement in measurements
+        ],
+        dtype=float,
+    )
+    signal_reference = _estimate_signal_reference(
+        mean_intensities,
+        distances,
+        usable,
+        config,
+    )
     for index, measurement in enumerate(measurements):
         measurement.equivalent_diameter_mm = float(smoothed[index])
         if np.isfinite(reference[index]) and reference[index] > 0:
@@ -517,6 +574,19 @@ def _measure_branch(
                     1.0,
                 )
             )
+        if (
+            np.isfinite(mean_intensities[index])
+            and np.isfinite(signal_reference[index])
+        ):
+            signal_value = float(mean_intensities[index])
+            reference_value = float(signal_reference[index])
+            difference = signal_value - reference_value
+            measurement.reference_mean_intensity = reference_value
+            measurement.intensity_difference = float(difference)
+            if abs(reference_value) > 1e-6:
+                measurement.intensity_change_ratio = float(
+                    difference / abs(reference_value)
+                )
 
     branch_result.measurements = measurements
     branch_result.candidates = _make_candidates(

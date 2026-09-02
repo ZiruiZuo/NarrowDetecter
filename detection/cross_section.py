@@ -6,10 +6,7 @@ from typing import Sequence, Tuple
 import numpy as np
 from scipy import ndimage as ndi
 
-try:
-    from .models import DetectorConfig
-except ImportError:
-    from models import DetectorConfig
+from ..models import DetectorConfig
 
 
 def make_sampling_grid(radius_mm: float, pixel_mm: float):

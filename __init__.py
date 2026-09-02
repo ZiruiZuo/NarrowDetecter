@@ -11,7 +11,7 @@ try:
         global_vector_of_interest_zyx,
         sample_cpr,
     )
-    from .detector import detect_coronary_stenosis
+    from .detection import detect_coronary_stenosis
     from .cpr_cli import run_cpr
     from .models import (
         BranchResult,

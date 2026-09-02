@@ -3,12 +3,12 @@ from __future__ import annotations
 from typing import Optional
 
 try:
-    from .detector import detect_coronary_stenosis
+    from .detection import detect_coronary_stenosis
     from .models import DetectionResult, DetectorConfig
     from .myio import read_mask_like, read_nifti_pair, write_results
     from .visualization import write_visualizations
 except ImportError:
-    from detector import detect_coronary_stenosis
+    from detection import detect_coronary_stenosis
     from models import DetectionResult, DetectorConfig
     from myio import read_mask_like, read_nifti_pair, write_results
     from visualization import write_visualizations

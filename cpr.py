@@ -417,12 +417,11 @@ def generate_label_cprs(
     image_direction_xyz: Sequence[float] | np.ndarray | None = None,
 ) -> list[CPRResult]:
     """Extract centerline trees from a label and generate CPR images."""
-    try:
-        from .anatomy import build_anatomical_plan, point_anatomical_label
-        from .centerline import extract_centerline_tree
-    except ImportError:
-        from anatomy import build_anatomical_plan, point_anatomical_label
-        from centerline import extract_centerline_tree
+    from .centerline import extract_centerline_tree
+    from .centerline.anatomy import (
+        build_anatomical_plan,
+        point_anatomical_label,
+    )
 
     label_array = np.asarray(label)
     image_array = np.asarray(image)
