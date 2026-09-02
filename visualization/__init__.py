@@ -11,8 +11,6 @@ from .volumes import (
     build_stenosis_marker_volume,
 )
 
-write_visualizations = write_detection_visualizations
-
 __all__ = [
     "build_anatomical_centerline_volume",
     "build_stenosis_marker_volume",

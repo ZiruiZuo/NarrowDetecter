@@ -6,10 +6,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import numpy as np
 from scipy import ndimage as ndi
 
-try:
-    from ..models import BranchResult, CPRConfig, CPRResult
-except ImportError:
-    from models import BranchResult, CPRResult
+from ..models import BranchResult, CPRConfig, CPRResult
 
 
 def global_vector_of_interest_zyx(
@@ -137,10 +134,7 @@ def _prepare_centerline_geometry(
             raise ValueError(
                 "Explicit distances cannot be combined with centerline resampling."
             )
-        try:
-            from ..centerline import smooth_and_resample_centerline
-        except ImportError:
-            from centerline import smooth_and_resample_centerline
+        from ..centerline import smooth_and_resample_centerline
 
         centerline, centerline_distances_mm = smooth_and_resample_centerline(
             centerline,
@@ -152,10 +146,7 @@ def _prepare_centerline_geometry(
     if (frames_u_zyx is None) != (frames_v_zyx is None):
         raise ValueError("frames_u_zyx and frames_v_zyx must be supplied together.")
     if frames_u_zyx is None:
-        try:
-            from ..centerline import tangents_and_frames
-        except ImportError:
-            from centerline import tangents_and_frames
+        from ..centerline import tangents_and_frames
 
         _, frames_u, frames_v = tangents_and_frames(centerline, spacing)
     else:

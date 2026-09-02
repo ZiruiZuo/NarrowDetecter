@@ -28,6 +28,17 @@ def _pyplot():
     return plt
 
 
+def _shade_candidates(axes, candidates) -> None:
+    for candidate in candidates:
+        axes.axvspan(
+            candidate.start_distance_mm,
+            candidate.end_distance_mm,
+            color="#d95f02",
+            alpha=0.14,
+            linewidth=0,
+        )
+
+
 def _anatomical_filename_stem(
     anatomical_label: str | None,
     fallback: str,
