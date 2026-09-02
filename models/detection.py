@@ -88,6 +88,10 @@ class CrossSectionMeasurement:
     area_mm2: float
     equivalent_diameter_mm: float
     prior_area_mm2: float
+    mean_lumen_intensity: Optional[float] = None
+    reference_mean_intensity: Optional[float] = None
+    intensity_difference: Optional[float] = None
+    intensity_change_ratio: Optional[float] = None
     branch_id: str = ""
     branch_index: int = 0
     distance_from_root_mm: float = 0.0

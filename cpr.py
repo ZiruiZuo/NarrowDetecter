@@ -1,37 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import ndimage as ndi
 
 try:
-    from .models import BranchResult
+    from .models import BranchResult, CPRResult
 except ImportError:
-    from models import BranchResult
-
-
-@dataclass(frozen=True)
-class CPRResult:
-    """A single-angle curved planar reformation for one branch."""
-
-    image: np.ndarray
-    centerline_distances_mm: np.ndarray
-    distances_from_root_mm: np.ndarray
-    offsets_mm: np.ndarray
-    angle_degrees: float
-    branch_id: str
-    anatomical_label: str
-    point_anatomical_labels: Tuple[str, ...]
-    mode: str = "straightened"
-    display_x_mm: Optional[np.ndarray] = None
-    display_y_mm: Optional[np.ndarray] = None
-    centerline_x_mm: Optional[np.ndarray] = None
-    centerline_y_mm: Optional[np.ndarray] = None
-    vector_of_interest_zyx: Optional[Tuple[float, float, float]] = None
-    vector_of_interest_lps_xyz: Optional[Tuple[float, float, float]] = None
-    sampling_line_length_mm: Optional[float] = None
+    from models import BranchResult, CPRResult
 
 
 def global_vector_of_interest_zyx(
