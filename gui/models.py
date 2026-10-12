@@ -206,6 +206,29 @@ class PathStore:
         self._active_path_id = path.path_id
         return path
 
+    def add_imported_path(self, source: ControlPath) -> ControlPath:
+        base_name = self._normalize_name(source.name)
+        name = base_name
+        sequence = 2
+        while self._name_exists(name):
+            name = f"{base_name}_{sequence}"
+            sequence += 1
+        imported = ControlPath(
+            path_id=str(uuid4()),
+            name=name,
+            control_points_lps_mm=[
+                _finite_triplet(point, "control point")
+                for point in source.control_points_lps_mm
+            ],
+            visible=bool(source.visible),
+            dirty=False,
+            cpr_settings=replace(source.cpr_settings),
+        )
+        imported.cpr_settings.validate()
+        self._paths[imported.path_id] = imported
+        self._active_path_id = imported.path_id
+        return imported
+
     def set_active(self, path_id: str) -> None:
         self.get_path(path_id)
         self._active_path_id = path_id
