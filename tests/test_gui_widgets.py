@@ -1,18 +1,29 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QWidget
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialogButtonBox,
+    QFileDialog,
+    QMessageBox,
+    QWidget,
+)
 
 from NarrowDetecter.gui.dialogs import DicomSeriesDialog
 from NarrowDetecter.gui.image_io import DicomSeriesInfo
 from NarrowDetecter.gui.image_io import LoadedVolume
 from NarrowDetecter.gui.models import ImageGeometry
 from NarrowDetecter.gui.models import CPRSettings, ControlPath
+from NarrowDetecter.gui.interactions import HitTarget
 
 
 class DicomSeriesDialogTests(unittest.TestCase):
@@ -81,6 +92,95 @@ class TriPlanarViewerTests(unittest.TestCase):
         self.assertTrue(all(not view.isHidden() for view in viewer.views.values()))
         self.assertTrue(np.allclose(viewer.crosshair_lps, expected))
 
+    def test_slice_scrolling_is_clamped_to_volume_extent(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        volume = self._volume()
+        viewer.set_volume(volume)
+        axial = viewer.views["axial"]
+
+        for _ in range(100):
+            axial._slice(1)
+        maximum = max(
+            volume.geometry.continuous_index_xyz_to_lps((x, y, z))[2]
+            for x in (0, volume.geometry.size_xyz[0] - 1)
+            for y in (0, volume.geometry.size_xyz[1] - 1)
+            for z in (0, volume.geometry.size_xyz[2] - 1)
+        )
+        self.assertLessEqual(viewer.crosshair_lps[2], maximum)
+
+        for _ in range(200):
+            axial._slice(-1)
+        minimum = min(
+            volume.geometry.continuous_index_xyz_to_lps((x, y, z))[2]
+            for x in (0, volume.geometry.size_xyz[0] - 1)
+            for y in (0, volume.geometry.size_xyz[1] - 1)
+            for z in (0, volume.geometry.size_xyz[2] - 1)
+        )
+        self.assertGreaterEqual(viewer.crosshair_lps[2], minimum)
+
+    def test_crosshair_and_path_lines_are_rendered_and_inactive_points_are_hit_testable(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        volume = self._volume()
+        viewer.set_volume(volume)
+        center = viewer.crosshair_lps
+        active = ControlPath("active", "Active", [center, (center[0] + 1.0, center[1], center[2])])
+        inactive = ControlPath("inactive", "Inactive", [center])
+        viewer.set_paths((active, inactive), active.path_id)
+
+        axial = viewer.views["axial"]
+        self.assertEqual(len(axial._crosshair_actors), 2)
+        self.assertGreaterEqual(len(axial._path_line_actors), 1)
+        inactive_actors = [
+            actor
+            for actor, target in axial._point_actors.items()
+            if target.path_id == inactive.path_id
+        ]
+        self.assertTrue(inactive_actors)
+        self.assertTrue(all(actor.GetPickable() for actor in inactive_actors))
+
+    def test_double_click_maximizes_without_appending_a_point(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        viewer.set_volume(self._volume())
+        appended = []
+        viewer.point_append_requested.connect(lambda *args: appended.append(args))
+        widget = viewer.views["axial"].vtk_widget
+        position = QPoint(widget.width() // 2, widget.height() // 2)
+
+        QTest.mouseClick(widget, Qt.MouseButton.LeftButton, pos=position)
+        QTest.mouseDClick(widget, Qt.MouseButton.LeftButton, pos=position)
+        QTest.mouseRelease(widget, Qt.MouseButton.LeftButton, pos=position)
+        QTest.qWait(500)
+
+        self.assertTrue(viewer.views["coronal"].isHidden())
+        self.assertEqual(appended, [])
+        viewer.close()
+
+    def test_click_on_inactive_point_does_not_append_to_active_path(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        viewer.set_volume(self._volume())
+        axial = viewer.views["axial"]
+        appended = []
+        viewer.point_append_requested.connect(lambda *args: appended.append(args))
+        widget = axial.vtk_widget
+        position = QPoint(widget.width() // 2, widget.height() // 2)
+
+        with mock.patch.object(
+            axial, "_pick", return_value=HitTarget("other", 0, False)
+        ):
+            QTest.mouseClick(widget, Qt.MouseButton.LeftButton, pos=position)
+            QTest.qWait(500)
+
+        self.assertEqual(appended, [])
+        viewer.close()
+
 
 class ControlPanelTests(unittest.TestCase):
     @classmethod
@@ -146,6 +246,9 @@ class _FakeViewer(QWidget):
     def set_window_level(self, window, level):
         self.window_level = (window, level)
 
+    def set_crosshair_lps(self, point):
+        self.crosshair_lps = tuple(point)
+
 
 class MainWindowStateTests(unittest.TestCase):
     @classmethod
@@ -163,6 +266,7 @@ class MainWindowStateTests(unittest.TestCase):
         first = window.path_store.active_path
         window.viewer.point_append_requested.emit("axial", (8.0, -2.6, 20.0))
         self.assertEqual(len(first.control_points_lps_mm), 1)
+        self.assertEqual(window.viewer.crosshair_lps, (8.0, -2.6, 20.0))
 
         second = window.create_path("Second")
         window.viewer.point_append_requested.emit("axial", (7.0, -2.0, 21.0))
@@ -189,6 +293,68 @@ class MainWindowStateTests(unittest.TestCase):
         window.set_active_path(first.path_id)
         self.assertEqual(window.cpr_panel.settings().mode, "straightened")
         self.assertEqual(second.cpr_settings.mode, "stretched")
+
+    def test_save_decision_persists_every_dirty_path_before_replacing_image(self):
+        window = self._window()
+        window.set_loaded_volume(TriPlanarViewerTests._volume())
+        first = window.path_store.active_path
+        first.control_points_lps_mm[:] = [(8.0, -2.6, 20.0), (7.0, -2.0, 21.0)]
+        first.dirty = True
+        second = window.create_path("Second")
+        second.control_points_lps_mm[:] = [(8.0, -2.6, 20.0), (7.0, -2.0, 21.0)]
+        second.dirty = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            outputs = [
+                (str(Path(directory) / "first.json"), "JSON"),
+                (str(Path(directory) / "second.json"), "JSON"),
+            ]
+            with mock.patch.object(
+                QMessageBox,
+                "warning",
+                return_value=QMessageBox.StandardButton.Save,
+            ), mock.patch.object(
+                QFileDialog,
+                "getSaveFileName",
+                side_effect=outputs,
+            ):
+                accepted = window._confirm_dirty_paths()
+
+            self.assertTrue(accepted)
+            self.assertTrue(all(not path.dirty for path in (first, second)))
+            self.assertTrue((Path(directory) / "first.json").is_file())
+            self.assertTrue((Path(directory) / "second.json").is_file())
+
+    def test_importing_path_saves_panel_settings_to_previous_active_path(self):
+        window = self._window()
+        volume = TriPlanarViewerTests._volume()
+        window.set_loaded_volume(volume)
+        previous = window.path_store.active_path
+        window.cpr_panel.mode.setCurrentIndex(
+            window.cpr_panel.mode.findData("straightened")
+        )
+        imported = ControlPath(
+            "source",
+            "Imported",
+            [(8.0, -2.6, 20.0), (7.0, -2.0, 21.0)],
+        )
+
+        with mock.patch(
+            "NarrowDetecter.gui.main_window.read_centerline_json",
+            return_value=(imported, volume.geometry),
+        ):
+            count = window.import_centerlines(("path.json",))
+
+        self.assertEqual(count, 1)
+        self.assertEqual(previous.cpr_settings.mode, "straightened")
+
+    def test_busy_state_disables_drag_and_drop_image_replacement(self):
+        window = self._window()
+        self.assertTrue(window.acceptDrops())
+        window._set_busy(True)
+        self.assertFalse(window.acceptDrops())
+        window._set_busy(False)
+        self.assertTrue(window.acceptDrops())
 
 
 if __name__ == "__main__":

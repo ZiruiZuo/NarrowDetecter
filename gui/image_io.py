@@ -146,13 +146,15 @@ def load_dicom_series(
 ) -> LoadedVolume:
     sitk = _simpleitk()
     reader = sitk.ImageSeriesReader()
-    files = sorted(
+    # GDCM returns files in acquisition/scan direction order.  Filename
+    # sorting can silently scramble ordinary non-zero-padded DICOM names.
+    files = [
         str(value)
         for value in reader.GetGDCMSeriesFileNames(
             str(directory),
             str(series_uid),
         )
-    )
+    ]
     if not files:
         raise ValueError(f"DICOM series '{series_uid}' contains no files.")
     reader.SetFileNames(files)

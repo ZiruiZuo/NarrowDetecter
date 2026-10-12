@@ -179,7 +179,7 @@ class MainWindow(QMainWindow):
 
     def _set_path_visibility(self, path_id: str, visible: bool) -> None:
         self.path_store.set_visibility(path_id, visible)
-        self._refresh_paths()
+        self.viewer.set_paths(self.path_store.paths, self.path_store.active_path_id)
 
     def _append_point(self, orientation: str, point_lps) -> None:
         del orientation
@@ -189,6 +189,7 @@ class MainWindow(QMainWindow):
             self.cpr_panel.set_status("点位于影像范围之外")
             return
         self.path_store.append_point(point_lps)
+        self.viewer.set_crosshair_lps(point_lps)
         self._refresh_paths()
 
     def _move_point(
@@ -263,6 +264,9 @@ class MainWindow(QMainWindow):
             self.import_image_source(source)
 
     def import_image_source(self, source: str | Path) -> bool:
+        if self._worker is not None:
+            self.cpr_panel.set_status("请先取消或等待当前 CPR 任务结束")
+            return False
         if not self._confirm_dirty_paths():
             return False
         try:
@@ -299,6 +303,8 @@ class MainWindow(QMainWindow):
         if self.volume is None:
             self._show_error("请先导入对应的影像。")
             return 0
+        if not self._store_current_settings():
+            return 0
         imported = 0
         for source in sources:
             try:
@@ -329,9 +335,15 @@ class MainWindow(QMainWindow):
             return False
         if not self._store_current_settings():
             return False
+        return self._export_path_centerline(path)
+
+    def _export_path_centerline(self, path) -> bool:
+        if self.volume is None:
+            self._show_error("没有可导出的中心线。")
+            return False
         destination, _ = QFileDialog.getSaveFileName(
             self,
-            "导出当前中心线",
+            f"导出中心线：{path.name}",
             f"{path.name}_centerline.json",
             "中心线 JSON (*.json)",
         )
@@ -347,13 +359,15 @@ class MainWindow(QMainWindow):
         return True
 
     def _confirm_dirty_paths(self) -> bool:
+        if not self._store_current_settings():
+            return False
         dirty = [path for path in self.path_store.paths if path.dirty]
         if not dirty:
             return True
         answer = QMessageBox.warning(
             self,
             "尚未保存的中心线",
-            "当前影像包含尚未保存的路径。是否先保存当前活动路径？",
+            f"当前影像包含 {len(dirty)} 条尚未保存的路径。是否逐条保存？",
             QMessageBox.StandardButton.Save
             | QMessageBox.StandardButton.Discard
             | QMessageBox.StandardButton.Cancel,
@@ -362,7 +376,7 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Cancel:
             return False
         if answer == QMessageBox.StandardButton.Save:
-            return self._export_active_centerline()
+            return all(self._export_path_centerline(path) for path in dirty)
         return True
 
     def start_cpr(self) -> None:
@@ -415,7 +429,9 @@ class MainWindow(QMainWindow):
         worker.completed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        worker.completed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
         thread.finished.connect(self._worker_thread_finished)
         self._worker = worker
         self._thread = thread
@@ -463,6 +479,7 @@ class MainWindow(QMainWindow):
         self.import_nifti_action.setEnabled(not busy)
         self.import_dicom_action.setEnabled(not busy)
         self.import_centerline_action.setEnabled(not busy)
+        self.setAcceptDrops(not busy)
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "NarrowDetecter CPR", str(message))

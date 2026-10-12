@@ -121,9 +121,19 @@ def generate_manual_cpr(
 
 
 def sanitized_path_name(name: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name).strip())
-    sanitized = sanitized.strip("._-")
-    return sanitized or "Path"
+    # Preserve Unicode names while replacing characters forbidden by Windows
+    # (and therefore unsafe for this application's primary platform).
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", str(name).strip())
+    sanitized = sanitized.rstrip(". ").strip()
+    if not sanitized:
+        return "Path"
+    stem = sanitized.split(".", 1)[0].upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update(f"COM{index}" for index in range(1, 10))
+    reserved.update(f"LPT{index}" for index in range(1, 10))
+    if stem in reserved:
+        sanitized = f"_{sanitized}"
+    return sanitized
 
 
 def _direct_child(root: Path, candidate: Path) -> bool:

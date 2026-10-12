@@ -7,8 +7,9 @@ from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication, QMenu, QVBoxLayout, QWidget
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
-from vtkmodules.vtkCommonDataModel import vtkPlane
-from vtkmodules.vtkFiltersSources import vtkSphereSource
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPlane, vtkPolyData
+from vtkmodules.vtkFiltersSources import vtkLineSource, vtkSphereSource
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkImageSlice,
@@ -44,6 +45,8 @@ class ImageView(QWidget):
         self._paths: tuple[ControlPath, ...] = ()
         self._active_path_id: str | None = None
         self._point_actors: dict[object, HitTarget] = {}
+        self._path_line_actors: list[object] = []
+        self._crosshair_actors: list[object] = []
         self._drag_target: HitTarget | None = None
         self._dragged = False
         self._middle_last: QPoint | None = None
@@ -101,6 +104,8 @@ class ImageView(QWidget):
         self._vtk_image = loaded_volume_to_vtk(volume)
         self._image_mapper.SetInputData(self._vtk_image)
         self._configure_camera()
+        self._refresh_crosshair_actors()
+        self.vtk_widget.update()
 
     def _configure_camera(self) -> None:
         camera = self.renderer.GetActiveCamera()
@@ -119,7 +124,9 @@ class ImageView(QWidget):
             raise ValueError("Crosshair must contain three finite LPS coordinates.")
         self._crosshair_lps = point.copy()
         self._slice_plane.SetOrigin(*point)
+        self._refresh_crosshair_actors()
         self._refresh_point_actors()
+        self.vtk_widget.update()
 
     def set_paths(
         self,
@@ -129,6 +136,7 @@ class ImageView(QWidget):
         self._paths = tuple(paths)
         self._active_path_id = active_path_id
         self._refresh_point_actors()
+        self.vtk_widget.update()
 
     def set_window_level(self, window: float, level: float) -> None:
         window = float(window)
@@ -138,6 +146,7 @@ class ImageView(QWidget):
         prop = self._image_actor.GetProperty()
         prop.SetColorWindow(window)
         prop.SetColorLevel(level)
+        self.vtk_widget.update()
 
     def _slice_spacing_mm(self) -> float:
         if self._volume is None:
@@ -148,10 +157,120 @@ class ImageView(QWidget):
         positive = projected[projected > 1e-8]
         return float(np.min(positive)) if positive.size else float(np.min(spacing))
 
+    def _slice_limits_mm(self) -> tuple[float, float] | None:
+        if self._volume is None:
+            return None
+        geometry = self._volume.geometry
+        upper = np.asarray(geometry.size_xyz, dtype=float) - 1.0
+        projections = [
+            float(
+                np.dot(
+                    self._normal,
+                    geometry.continuous_index_xyz_to_lps((x, y, z)),
+                )
+            )
+            for x in (0.0, upper[0])
+            for y in (0.0, upper[1])
+            for z in (0.0, upper[2])
+        ]
+        return min(projections), max(projections)
+
     def _clear_point_actors(self) -> None:
         for actor in tuple(self._point_actors):
             self.renderer.RemoveActor(actor)
         self._point_actors.clear()
+        for actor in self._path_line_actors:
+            self.renderer.RemoveActor(actor)
+        self._path_line_actors.clear()
+
+    def _line_actor(
+        self,
+        start,
+        end,
+        *,
+        color=(0.0, 0.75, 0.9),
+        opacity=0.65,
+        width=1.0,
+    ):
+        source = vtkLineSource()
+        source.SetPoint1(*start)
+        source.SetPoint2(*end)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetOpacity(float(opacity))
+        actor.GetProperty().SetLineWidth(float(width))
+        actor.SetPickable(False)
+        return actor
+
+    def _refresh_crosshair_actors(self) -> None:
+        for actor in self._crosshair_actors:
+            self.renderer.RemoveActor(actor)
+        self._crosshair_actors.clear()
+        if self._volume is None:
+            return
+        geometry = self._volume.geometry
+        upper = np.asarray(geometry.size_xyz, dtype=float) - 1.0
+        corners = np.asarray(
+            [
+                geometry.continuous_index_xyz_to_lps((x, y, z))
+                for x in (0.0, upper[0])
+                for y in (0.0, upper[1])
+                for z in (0.0, upper[2])
+            ],
+            dtype=float,
+        )
+        for axis in self._axes[:2]:
+            values = corners @ axis
+            center_value = float(np.dot(self._crosshair_lps, axis))
+            start = self._crosshair_lps + (float(values.min()) - center_value) * axis
+            end = self._crosshair_lps + (float(values.max()) - center_value) * axis
+            actor = self._line_actor(start, end, opacity=0.55)
+            self.renderer.AddActor(actor)
+            self._crosshair_actors.append(actor)
+
+    def _add_path_line_actor(
+        self,
+        path: ControlPath,
+        spacing: float,
+        slice_position: float,
+        active: bool,
+    ) -> None:
+        points = vtkPoints()
+        lines = vtkCellArray()
+        segment_count = 0
+        coordinates = path.control_points_lps_mm
+        for left, right in zip(coordinates, coordinates[1:]):
+            left_array = np.asarray(left, dtype=float)
+            right_array = np.asarray(right, dtype=float)
+            left_distance = abs(float(np.dot(self._normal, left_array)) - slice_position)
+            right_distance = abs(float(np.dot(self._normal, right_array)) - slice_position)
+            if max(left_distance, right_distance) > 1.5 * spacing:
+                continue
+            left_id = points.InsertNextPoint(*left_array)
+            right_id = points.InsertNextPoint(*right_array)
+            lines.InsertNextCell(2)
+            lines.InsertCellPoint(left_id)
+            lines.InsertCellPoint(right_id)
+            segment_count += 1
+        if segment_count == 0:
+            return
+        polydata = vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.SetLines(lines)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        color = (1.0, 0.75, 0.1) if active else (0.45, 0.7, 1.0)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetOpacity(0.9 if active else 0.45)
+        actor.GetProperty().SetLineWidth(2.0 if active else 1.0)
+        actor.SetPickable(False)
+        self.renderer.AddActor(actor)
+        self._path_line_actors.append(actor)
 
     def _refresh_point_actors(self) -> None:
         self._clear_point_actors()
@@ -161,6 +280,7 @@ class ImageView(QWidget):
             if not path.visible:
                 continue
             active = path.path_id == self._active_path_id
+            self._add_path_line_actor(path, spacing, slice_position, active)
             for index, coordinates in enumerate(path.control_points_lps_mm):
                 point = np.asarray(coordinates, dtype=float)
                 distance = abs(float(np.dot(self._normal, point)) - slice_position)
@@ -182,7 +302,9 @@ class ImageView(QWidget):
                 actor.GetProperty().SetOpacity(
                     1.0 if distance <= 0.5 * spacing else 0.25
                 )
-                actor.SetPickable(active and distance <= 0.5 * spacing)
+                # Solid inactive points remain pickable for hit suppression,
+                # but event handling only permits edits on the active path.
+                actor.SetPickable(distance <= 0.5 * spacing)
                 self.renderer.AddActor(actor)
                 self._point_actors[actor] = HitTarget(path.path_id, index, active)
 
@@ -225,6 +347,9 @@ class ImageView(QWidget):
     def _slice(self, direction: int) -> None:
         scalar = float(np.dot(self._normal, self._crosshair_lps))
         scalar += (1.0 if direction > 0 else -1.0) * self._slice_spacing_mm()
+        limits = self._slice_limits_mm()
+        if limits is not None:
+            scalar = float(np.clip(scalar, limits[0], limits[1]))
         point = self._crosshair_lps + (
             scalar - float(np.dot(self._normal, self._crosshair_lps))
         ) * self._normal
@@ -269,13 +394,15 @@ class ImageView(QWidget):
                 self._middle_last = mouse.position().toPoint()
                 return True
             target = self._pick(mouse)
-            if mouse.button() == Qt.MouseButton.LeftButton and target and target.is_active:
-                self._clicks.cancel_pending()
-                self._drag_target = target
-                self._dragged = False
+            if mouse.button() == Qt.MouseButton.LeftButton:
+                if target and target.is_active:
+                    self._clicks.cancel_pending()
+                    self._drag_target = target
+                    self._dragged = False
                 return True
-            if mouse.button() == Qt.MouseButton.RightButton and target and target.is_active:
-                self._show_context_menu(target, mouse.globalPosition().toPoint())
+            if mouse.button() == Qt.MouseButton.RightButton:
+                if target and target.is_active:
+                    self._show_context_menu(target, mouse.globalPosition().toPoint())
                 return True
         if event_type == QEvent.Type.MouseMove:
             mouse = event
@@ -295,6 +422,8 @@ class ImageView(QWidget):
                 return True
             if self._middle_last is not None:
                 self._pan(mouse)
+                return True
+            if mouse.buttons() & Qt.MouseButton.LeftButton:
                 return True
         if event_type == QEvent.Type.MouseButtonRelease:
             mouse = event
@@ -320,6 +449,9 @@ class ImageView(QWidget):
                         lambda: self.maximize_requested.emit(self),
                     )
                     return True
+                return True
+            if mouse.button() == Qt.MouseButton.RightButton:
+                return True
         if event_type == QEvent.Type.Wheel:
             wheel: QWheelEvent = event
             direction = wheel.angleDelta().y()

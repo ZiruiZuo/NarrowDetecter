@@ -366,5 +366,16 @@ def _result(angle: float, mode: str) -> CPRResult:
     )
 
 
+class PathNameSanitizingTests(unittest.TestCase):
+    def test_unicode_names_are_preserved_and_windows_invalid_names_are_safe(self):
+        from NarrowDetecter.gui.cpr_adapter import sanitized_path_name
+
+        self.assertEqual(sanitized_path_name("左冠回旋支"), "左冠回旋支")
+        self.assertEqual(sanitized_path_name("右冠动脉"), "右冠动脉")
+        self.assertEqual(sanitized_path_name("A:B/C"), "A_B_C")
+        self.assertEqual(sanitized_path_name("CON"), "_CON")
+        self.assertEqual(sanitized_path_name("..."), "Path")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -80,7 +80,7 @@ class GUIImageIOTests(unittest.TestCase):
         self.assertEqual(series[1].series_number, "12")
         self.assertEqual(series[1].file_count, 2)
 
-    def test_load_dicom_series_uses_only_requested_sorted_files(self):
+    def test_load_dicom_series_preserves_requested_gdcm_file_order(self):
         fake = _FakeSimpleITK()
         fake.series_files = {
             "wanted": ["z.dcm", "a.dcm"],
@@ -93,7 +93,7 @@ class GUIImageIOTests(unittest.TestCase):
         ):
             loaded = load_dicom_series("dicom", "wanted")
 
-        self.assertEqual(fake.last_reader.file_names, ["a.dcm", "z.dcm"])
+        self.assertEqual(fake.last_reader.file_names, ["z.dcm", "a.dcm"])
         self.assertEqual(loaded.series_uid, "wanted")
         self.assertEqual(loaded.source_kind, "dicom")
 
