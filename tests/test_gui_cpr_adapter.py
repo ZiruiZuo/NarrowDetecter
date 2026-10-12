@@ -117,6 +117,38 @@ class ManualCPRAdapterTests(unittest.TestCase):
         self.assertEqual(first["pixel_mm"], 0.4)
         self.assertTrue(first["preserve_input_order"])
 
+    def test_legacy_generator_without_order_keyword_remains_supported(self):
+        self.path.cpr_settings = CPRSettings(
+            angle_start_degrees=0.0,
+            angle_end_degrees=0.0,
+        )
+
+        def legacy_generator(
+            image,
+            centerline_voxel_zyx,
+            spacing_zyx,
+            angle_degrees,
+            sampling_line_length_mm,
+            slice_resolution_mm,
+            interpolation_order,
+            name,
+            curve_resolution_mm,
+            centerline_smoothing_sigma_mm,
+            image_direction_xyz,
+            start_extension_mm,
+            end_extension_mm,
+        ):
+            return _result(angle_degrees, "stretched")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch(
+                "NarrowDetecter.gui.cpr_adapter.generate_stretched_cpr",
+                new=legacy_generator,
+            ):
+                results = generate_manual_cpr(self._request(Path(directory)))
+
+        self.assertEqual(len(results), 1)
+
     def test_invalid_or_unusable_paths_are_rejected_before_generation(self):
         bad_paths = (
             [(1.0, 2.0, 3.0)],

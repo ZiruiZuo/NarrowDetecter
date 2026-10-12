@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 import shutil
 from collections.abc import Callable
@@ -57,6 +58,16 @@ def _manual_centerline_zyx(request: ManualCPRRequest) -> np.ndarray:
     return indices_xyz[:, ::-1].copy()
 
 
+def _manual_order_arguments(generator: Callable) -> dict[str, bool]:
+    parameters = inspect.signature(generator).parameters.values()
+    supports_keyword = any(
+        parameter.name == "preserve_input_order"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    return {"preserve_input_order": True} if supports_keyword else {}
+
+
 def generate_manual_cpr(
     request: ManualCPRRequest,
     *,
@@ -86,17 +97,18 @@ def generate_manual_cpr(
             centerline_smoothing_sigma_mm=SMOOTHING_SIGMA_MM,
             start_extension_mm=0.0,
             end_extension_mm=0.0,
-            preserve_input_order=True,
         )
         if str(settings.mode).lower() == "straightened":
             result = generate_centerline_cpr(
                 **common,
+                **_manual_order_arguments(generate_centerline_cpr),
                 radius_mm=0.5 * float(settings.sampling_line_length_mm),
                 pixel_mm=float(settings.slice_resolution_mm),
             )
         else:
             result = generate_stretched_cpr(
                 **common,
+                **_manual_order_arguments(generate_stretched_cpr),
                 sampling_line_length_mm=float(
                     settings.sampling_line_length_mm
                 ),
