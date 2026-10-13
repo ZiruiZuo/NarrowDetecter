@@ -41,6 +41,8 @@ def run_cpr(
     min_branch_mean_radius_mm: float = 0.4,
     max_branch_order: Optional[int] = None,
     stenosis_result_path: Optional[str] = None,
+    start_extension_mm: float = 15.0,
+    end_extension_mm: float = 15.0,
 ) -> list[CPRResult]:
     """Generate CPR from either an ordered centerline or a vessel label."""
     if (centerline_voxel_zyx is None) == (label_path is None):
@@ -60,6 +62,14 @@ def run_cpr(
         or sampling_line_length_mm <= 0
     ):
         raise ValueError("sampling_line_length_mm must be positive and finite.")
+    extensions = np.asarray(
+        [start_extension_mm, end_extension_mm],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(extensions)) or np.any(extensions < 0):
+        raise ValueError(
+            "CPR endpoint extensions must be finite and nonnegative."
+        )
     mode_name = str(mode).lower()
     if mode_name not in {"straightened", "stretched"}:
         raise ValueError("mode must be 'straightened' or 'stretched'.")
@@ -102,6 +112,8 @@ def run_cpr(
             min_branch_mean_radius_mm=min_branch_mean_radius_mm,
             max_branch_order=max_branch_order,
             sampling_line_length_mm=sampling_line_length_mm,
+            start_extension_mm=start_extension_mm,
+            end_extension_mm=end_extension_mm,
             pixel_mm=slice_resolution_mm,
             interpolation_order=interpolation_order,
             mode=mode_name,
@@ -144,6 +156,8 @@ def run_cpr(
                 centerline_smoothing_sigma_mm=(
                     centerline_smoothing_sigma_mm
                 ),
+                start_extension_mm=start_extension_mm,
+                end_extension_mm=end_extension_mm,
             )
             if mode_name == "straightened":
                 cpr = generate_centerline_cpr(

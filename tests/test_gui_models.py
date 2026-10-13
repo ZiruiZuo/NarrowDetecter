@@ -81,6 +81,15 @@ class CPRSettingsTests(unittest.TestCase):
 
 
 class PathStoreTests(unittest.TestCase):
+    @staticmethod
+    def _identity_geometry():
+        return ImageGeometry(
+            size_xyz=(64, 64, 64),
+            spacing_xyz=(1.0, 1.0, 1.0),
+            origin_lps_xyz=(0.0, 0.0, 0.0),
+            direction_xyz=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        )
+
     def test_default_names_are_unique_and_rename_rejects_collision(self):
         store = PathStore()
         first = store.create_path()
@@ -123,6 +132,7 @@ class PathStoreTests(unittest.TestCase):
                 0,
                 "axial",
                 (9.0, 9.0, 9.0),
+                self._identity_geometry(),
             )
         self.assertEqual(store.active_path_id, second.path_id)
 
@@ -149,6 +159,7 @@ class PathStoreTests(unittest.TestCase):
                     0,
                     orientation,
                     (10.0, 20.0, 30.0),
+                    self._identity_geometry(),
                 )
 
                 moved = path.control_points_lps_mm[0]

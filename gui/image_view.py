@@ -37,6 +37,7 @@ class ImageView(QWidget):
     def __init__(self, orientation: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.orientation = str(orientation).lower()
+        self._slice_axis = {"sagittal": 0, "coronal": 1, "axial": 2}[self.orientation]
         self._axes = orthogonal_plane_axes(self.orientation)
         self._normal = self._axes[2]
         self._volume: LoadedVolume | None = None
@@ -99,17 +100,35 @@ class ImageView(QWidget):
         timer.stop()
         timer.deleteLater()
 
-    def set_volume(self, volume: LoadedVolume) -> None:
+    def set_volume(
+        self,
+        volume: LoadedVolume,
+        crosshair_lps: Sequence[float] | None = None,
+    ) -> None:
         self._volume = volume
+        self._axes = orthogonal_plane_axes(self.orientation) @ volume.geometry.direction_matrix.T
+        self._normal = self._axes[2]
+        self._slice_plane.SetNormal(*self._normal)
         self._vtk_image = loaded_volume_to_vtk(volume)
         self._image_mapper.SetInputData(self._vtk_image)
+        if crosshair_lps is None:
+            center_index = np.asarray(volume.geometry.size_xyz, dtype=int) // 2
+            crosshair_lps = volume.geometry.continuous_index_xyz_to_lps(center_index)
+        self.set_crosshair_lps(crosshair_lps)
         self._configure_camera()
         self._refresh_crosshair_actors()
+        # Initializing before the mapper has input can crash native VTK.
+        if (
+            QApplication.platformName().lower() != "offscreen"
+            and not self.vtk_widget.GetEnabled()
+        ):
+            self.vtk_widget.Initialize()
         self.vtk_widget.update()
 
     def _configure_camera(self) -> None:
         camera = self.renderer.GetActiveCamera()
-        normal = self._normal
+        # Reverse the viewing side to mirror the horizontal screen axis only.
+        normal = -np.cross(self._axes[0], self._axes[1])
         view_up = self._axes[1]
         center = self._crosshair_lps
         camera.SetFocalPoint(*center)
@@ -122,6 +141,15 @@ class ImageView(QWidget):
         point = np.asarray(point_lps, dtype=float)
         if point.shape != (3,) or np.any(~np.isfinite(point)):
             raise ValueError("Crosshair must contain three finite LPS coordinates.")
+        if self._volume is not None:
+            geometry = self._volume.geometry
+            index = np.asarray(geometry.lps_to_continuous_index_xyz(point))
+            index[self._slice_axis] = np.clip(
+                np.floor(index[self._slice_axis] + 0.5),
+                0,
+                geometry.size_xyz[self._slice_axis] - 1,
+            )
+            point = np.asarray(geometry.continuous_index_xyz_to_lps(index))
         self._crosshair_lps = point.copy()
         self._slice_plane.SetOrigin(*point)
         self._refresh_crosshair_actors()
@@ -151,29 +179,7 @@ class ImageView(QWidget):
     def _slice_spacing_mm(self) -> float:
         if self._volume is None:
             return 1.0
-        direction = self._volume.geometry.direction_matrix
-        spacing = np.asarray(self._volume.geometry.spacing_xyz, dtype=float)
-        projected = np.abs(self._normal @ direction) * spacing
-        positive = projected[projected > 1e-8]
-        return float(np.min(positive)) if positive.size else float(np.min(spacing))
-
-    def _slice_limits_mm(self) -> tuple[float, float] | None:
-        if self._volume is None:
-            return None
-        geometry = self._volume.geometry
-        upper = np.asarray(geometry.size_xyz, dtype=float) - 1.0
-        projections = [
-            float(
-                np.dot(
-                    self._normal,
-                    geometry.continuous_index_xyz_to_lps((x, y, z)),
-                )
-            )
-            for x in (0.0, upper[0])
-            for y in (0.0, upper[1])
-            for z in (0.0, upper[2])
-        ]
-        return min(projections), max(projections)
+        return float(self._volume.geometry.spacing_xyz[self._slice_axis])
 
     def _clear_point_actors(self) -> None:
         for actor in tuple(self._point_actors):
@@ -345,16 +351,19 @@ class ImageView(QWidget):
         self.vtk_widget.update()
 
     def _slice(self, direction: int) -> None:
-        scalar = float(np.dot(self._normal, self._crosshair_lps))
-        scalar += (1.0 if direction > 0 else -1.0) * self._slice_spacing_mm()
-        limits = self._slice_limits_mm()
-        if limits is not None:
-            scalar = float(np.clip(scalar, limits[0], limits[1]))
-        point = self._crosshair_lps + (
-            scalar - float(np.dot(self._normal, self._crosshair_lps))
-        ) * self._normal
-        self.set_crosshair_lps(point)
-        self.slice_position_changed.emit(self.orientation, scalar)
+        if self._volume is None:
+            return
+        geometry = self._volume.geometry
+        index = np.asarray(geometry.lps_to_continuous_index_xyz(self._crosshair_lps))
+        axis = self._slice_axis
+        next_slice = int(np.clip(
+            int(np.floor(index[axis] + 0.5)) + (1 if direction > 0 else -1),
+            0,
+            geometry.size_xyz[axis] - 1,
+        ))
+        index[axis] = next_slice
+        self.set_crosshair_lps(geometry.continuous_index_xyz_to_lps(index))
+        self.slice_position_changed.emit(self.orientation, float(next_slice))
 
     def _pan(self, event) -> None:
         if self._middle_last is None:
@@ -377,6 +386,7 @@ class ImageView(QWidget):
         camera.SetPosition(*(np.asarray(camera.GetPosition()) + shift))
         camera.SetFocalPoint(*(np.asarray(camera.GetFocalPoint()) + shift))
         self._middle_last = current
+        self.vtk_widget.update()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is not self.vtk_widget:

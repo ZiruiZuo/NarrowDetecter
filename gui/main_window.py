@@ -199,9 +199,11 @@ class MainWindow(QMainWindow):
         point_index: int,
         point_lps,
     ) -> None:
+        if self.volume is None:
+            return
         try:
             self.path_store.move_point_in_view(
-                path_id, point_index, orientation, point_lps
+                path_id, point_index, orientation, point_lps, self.volume.geometry
             )
         except (PermissionError, IndexError, KeyError):
             return

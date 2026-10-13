@@ -20,6 +20,7 @@ class TriPlanarViewer(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._crosshair_lps = np.zeros(3, dtype=float)
+        self._volume: LoadedVolume | None = None
         self._maximized: ImageView | None = None
         self.views = {
             name: ImageView(name, self)
@@ -31,6 +32,7 @@ class TriPlanarViewer(QWidget):
         layout.addWidget(self.views["axial"], 0, 0)
         layout.addWidget(self.views["coronal"], 0, 1)
         layout.addWidget(self.views["sagittal"], 1, 0)
+        self._grid = layout
         layout.setRowStretch(0, 1)
         layout.setRowStretch(1, 1)
         layout.setColumnStretch(0, 1)
@@ -49,12 +51,12 @@ class TriPlanarViewer(QWidget):
         return tuple(float(value) for value in self._crosshair_lps)
 
     def set_volume(self, volume: LoadedVolume) -> None:
-        center_index = (np.asarray(volume.geometry.size_xyz, dtype=float) - 1.0) / 2.0
+        self._volume = volume
+        center_index = np.asarray(volume.geometry.size_xyz, dtype=int) // 2
         center = volume.geometry.continuous_index_xyz_to_lps(center_index)
         self._crosshair_lps = np.asarray(center, dtype=float)
         for view in self.views.values():
-            view.set_crosshair_lps(center)
-            view.set_volume(volume)
+            view.set_volume(volume, center)
 
     def set_crosshair_lps(self, point_lps: Sequence[float]) -> None:
         point = np.asarray(point_lps, dtype=float)
@@ -77,20 +79,30 @@ class TriPlanarViewer(QWidget):
             view.set_window_level(window, level)
 
     def _on_slice_position_changed(self, orientation: str, position: float) -> None:
+        if self._volume is None:
+            return
         axis = {"sagittal": 0, "coronal": 1, "axial": 2}[orientation]
-        point = self._crosshair_lps.copy()
-        point[axis] = float(position)
-        self.set_crosshair_lps(point)
+        geometry = self._volume.geometry
+        index = np.asarray(geometry.lps_to_continuous_index_xyz(self._crosshair_lps))
+        index[axis] = float(position)
+        self.set_crosshair_lps(geometry.continuous_index_xyz_to_lps(index))
 
     def toggle_maximize(self, view: ImageView) -> None:
         if view not in self.views.values():
             raise ValueError("The requested view does not belong to this viewer.")
         if self._maximized is view:
             self._maximized = None
+            for index in (0, 1):
+                self._grid.setRowStretch(index, 1)
+                self._grid.setColumnStretch(index, 1)
             for candidate in self.views.values():
                 candidate.show()
             return
         self._maximized = view
         for candidate in self.views.values():
             candidate.setVisible(candidate is view)
+        row, column, _, _ = self._grid.getItemPosition(self._grid.indexOf(view))
+        for index in (0, 1):
+            self._grid.setRowStretch(index, int(index == row))
+            self._grid.setColumnStretch(index, int(index == column))
 

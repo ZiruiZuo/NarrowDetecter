@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -28,15 +29,39 @@ def _pyplot():
     return plt
 
 
-def _shade_candidates(axes, candidates) -> None:
-    for candidate in candidates:
-        axes.axvspan(
-            candidate.start_distance_mm,
-            candidate.end_distance_mm,
-            color="#d95f02",
-            alpha=0.14,
-            linewidth=0,
-        )
+def _straightened_display_geometry(cpr: CPRResult):
+    """Orient a straightened CPR from anatomical start to end."""
+    distance_origin = float(cpr.centerline_distances_mm[0])
+    display_distances = (
+        np.asarray(cpr.centerline_distances_mm, dtype=float)
+        - distance_origin
+    )
+    return (
+        np.asarray(cpr.image),
+        display_distances,
+        tuple(cpr.point_anatomical_labels),
+        distance_origin,
+    )
+
+
+def _stretched_display_geometry(cpr: CPRResult) -> CPRResult:
+    """Place the anatomical start of a stretched CPR at display (0, 0)."""
+    if (
+        cpr.display_x_mm is None
+        or cpr.display_y_mm is None
+        or cpr.centerline_x_mm is None
+        or cpr.centerline_y_mm is None
+    ):
+        raise ValueError("Stretched CPR result is missing display geometry.")
+    x_origin = float(cpr.centerline_x_mm[0])
+    return replace(
+        cpr,
+        display_x_mm=np.asarray(cpr.display_x_mm, dtype=float) - x_origin,
+        centerline_x_mm=(
+            np.asarray(cpr.centerline_x_mm, dtype=float) - x_origin
+        ),
+        centerline_y_mm=np.asarray(cpr.centerline_y_mm, dtype=float),
+    )
 
 
 def _anatomical_filename_stem(
@@ -75,6 +100,29 @@ def _angle_filename_stem(angle_degrees: float) -> str:
 def _candidate_annotation(candidate: StenosisCandidate) -> str:
     percent = 100.0 * float(candidate.max_diameter_stenosis)
     return f"{percent:.1f}%"
+
+
+def _orient_candidates_for_cpr(
+    cpr: CPRResult,
+    candidates: Sequence[StenosisCandidate],
+) -> tuple[StenosisCandidate, ...]:
+    """Convert source-order candidate distances to z-oriented CPR distances."""
+    if not cpr.source_distance_reversed:
+        return tuple(candidates)
+    if cpr.source_centerline_length_mm is None:
+        raise ValueError(
+            "Reversed CPR results require source_centerline_length_mm."
+        )
+    length = float(cpr.source_centerline_length_mm)
+    return tuple(
+        replace(
+            candidate,
+            start_distance_mm=length - candidate.end_distance_mm,
+            end_distance_mm=length - candidate.start_distance_mm,
+            min_distance_mm=length - candidate.min_distance_mm,
+        )
+        for candidate in candidates
+    )
 
 
 def _stretched_candidate_marker_geometry(
@@ -157,8 +205,11 @@ def _write_cpr_result(
     candidates: Sequence[StenosisCandidate],
     dpi: int,
     used_names: set[str],
+    show_centerline: bool = True,
+    include_mode_in_filename: bool = False,
 ):
     plt = _pyplot()
+    candidates = _orient_candidates_for_cpr(cpr, candidates)
     finite = cpr.image[np.isfinite(cpr.image)]
     low, high = (
         np.percentile(finite, (1, 99))
@@ -168,46 +219,40 @@ def _write_cpr_result(
     if high <= low:
         high = low + 1.0
 
-    distances = cpr.centerline_distances_mm
     figure, axes = plt.subplots(
         figsize=(10.5, 5.2),
         constrained_layout=True,
     )
-    point_labels = cpr.point_anatomical_labels
     if cpr.mode == "stretched":
-        if (
-            cpr.display_x_mm is None
-            or cpr.display_y_mm is None
-            or cpr.centerline_x_mm is None
-            or cpr.centerline_y_mm is None
-        ):
-            raise ValueError("Stretched CPR result is missing display geometry.")
+        displayed_cpr = _stretched_display_geometry(cpr)
+        point_labels = displayed_cpr.point_anatomical_labels
         display = axes.imshow(
             cpr.image,
             cmap="gray",
-            origin="lower",
+            origin="upper",
             aspect="equal",
             extent=[
-                float(cpr.display_x_mm[0]),
-                float(cpr.display_x_mm[-1]),
-                float(cpr.display_y_mm[0]),
-                float(cpr.display_y_mm[-1]),
+                float(displayed_cpr.display_x_mm[0]),
+                float(displayed_cpr.display_x_mm[-1]),
+                float(displayed_cpr.display_y_mm[-1]),
+                float(displayed_cpr.display_y_mm[0]),
             ],
             vmin=float(low),
             vmax=float(high),
             interpolation="nearest",
         )
-        axes.plot(
-            cpr.centerline_x_mm,
-            cpr.centerline_y_mm,
-            color="#00bcd4",
-            linewidth=1.0,
-            label="Unfolded centerline",
-        )
+        if show_centerline:
+            axes.plot(
+                displayed_cpr.centerline_x_mm,
+                displayed_cpr.centerline_y_mm,
+                color="#00bcd4",
+                linewidth=1.0,
+                label="Unfolded centerline",
+            )
         for marker_index, candidate in enumerate(candidates):
             marker_start, marker_end, label_position = (
                 _stretched_candidate_marker_geometry(
-                    cpr,
+                    displayed_cpr,
                     candidate,
                     label_level=marker_index % 3,
                 )
@@ -234,8 +279,8 @@ def _write_cpr_result(
         for index in range(1, len(point_labels)):
             if point_labels[index] != point_labels[index - 1]:
                 axes.text(
-                    cpr.centerline_x_mm[index],
-                    cpr.centerline_y_mm[index],
+                    displayed_cpr.centerline_x_mm[index],
+                    displayed_cpr.centerline_y_mm[index],
                     point_labels[index],
                     ha="left",
                     va="bottom",
@@ -244,12 +289,18 @@ def _write_cpr_result(
         axes.set_xlabel("Coordinate along vector of interest (mm)")
         axes.set_ylabel("Accumulated perpendicular distance (mm)")
     else:
-        x_start = float(distances[0])
-        x_end = float(distances[-1])
+        (
+            display_image,
+            display_distances,
+            point_labels,
+            distance_origin,
+        ) = _straightened_display_geometry(cpr)
+        x_start = float(display_distances[0])
+        x_end = float(display_distances[-1])
         if x_end <= x_start:
             x_end = x_start + 1e-6
         display = axes.imshow(
-            cpr.image.T,
+            display_image.T,
             cmap="gray",
             origin="lower",
             aspect="auto",
@@ -263,11 +314,26 @@ def _write_cpr_result(
             vmax=float(high),
             interpolation="nearest",
         )
-        _shade_candidates(axes, candidates)
-        axes.axhline(0.0, color="#00bcd4", linewidth=0.8, alpha=0.8)
+        for candidate in candidates:
+            axes.axvspan(
+                candidate.start_distance_mm - distance_origin,
+                candidate.end_distance_mm - distance_origin,
+                color="#d95f02",
+                alpha=0.14,
+                linewidth=0,
+            )
+        if show_centerline:
+            axes.axhline(
+                0.0,
+                color="#00bcd4",
+                linewidth=0.8,
+                alpha=0.8,
+            )
         y_max = float(cpr.offsets_mm[-1])
         for marker_index, candidate in enumerate(candidates):
-            marker_x = float(candidate.min_distance_mm)
+            marker_x = float(
+                candidate.min_distance_mm - distance_origin
+            )
             axes.axvline(
                 marker_x,
                 color="#d95f02",
@@ -300,7 +366,7 @@ def _write_cpr_result(
         for index in range(1, len(point_labels)):
             if point_labels[index] == point_labels[index - 1]:
                 continue
-            transition = float(distances[index])
+            transition = float(display_distances[index])
             axes.axvline(
                 transition,
                 color="#9467bd",
@@ -329,7 +395,11 @@ def _write_cpr_result(
         cpr.anatomical_label,
         cpr.branch_id,
     )
-    mode_stem = "_stretched" if cpr.mode == "stretched" else ""
+    mode_stem = (
+        f"_{cpr.mode}"
+        if include_mode_in_filename
+        else ("_stretched" if cpr.mode == "stretched" else "")
+    )
     filename_stem = (
         f"{anatomical_stem}{mode_stem}_CPR_"
         f"{_angle_filename_stem(cpr.angle_degrees)}"
@@ -350,6 +420,8 @@ def write_cpr_result(
     output_dir: str,
     dpi: int = 160,
     candidates: Sequence[StenosisCandidate] = (),
+    show_centerline: bool = True,
+    include_mode_in_filename: bool = False,
 ) -> Dict[str, Path]:
     """Write one standalone CPR result with optional stenosis markers."""
     output = Path(output_dir)
@@ -360,6 +432,8 @@ def write_cpr_result(
         candidates=candidates,
         dpi=dpi,
         used_names=set(),
+        show_centerline=show_centerline,
+        include_mode_in_filename=include_mode_in_filename,
     )
     return {"png_path": png_path}
 

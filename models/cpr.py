@@ -19,6 +19,8 @@ class CPRConfig:
     min_branch_length_mm: float = 3.0
     min_branch_mean_radius_mm: float = 0.4
     max_branch_order: int | None = None
+    start_extension_mm: float = 15.0
+    end_extension_mm: float = 15.0
 
     def validate(self) -> None:
         angles = tuple(float(value) for value in self.angles_degrees)
@@ -34,6 +36,14 @@ class CPRConfig:
         ):
             raise ValueError(
                 "sampling_line_length_mm must be positive and finite."
+            )
+        extensions = np.asarray(
+            [self.start_extension_mm, self.end_extension_mm],
+            dtype=float,
+        )
+        if np.any(~np.isfinite(extensions)) or np.any(extensions < 0):
+            raise ValueError(
+                "CPR endpoint extensions must be finite and nonnegative."
             )
         if not 0 <= self.interpolation_order <= 5:
             raise ValueError(
@@ -70,3 +80,5 @@ class CPRResult:
     vector_of_interest_zyx: Optional[Tuple[float, float, float]] = None
     vector_of_interest_lps_xyz: Optional[Tuple[float, float, float]] = None
     sampling_line_length_mm: Optional[float] = None
+    source_distance_reversed: bool = False
+    source_centerline_length_mm: Optional[float] = None

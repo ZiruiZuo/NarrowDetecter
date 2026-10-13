@@ -115,6 +115,7 @@ def _prepare_centerline_geometry(
     centerline_distances_mm: np.ndarray | None,
     curve_resolution_mm: float | None,
     centerline_smoothing_sigma_mm: float,
+    preserve_input_order: bool = False,
 ):
     centerline = np.asarray(centerline_voxel_zyx, dtype=float)
     spacing = np.asarray(spacing_zyx, dtype=float)
@@ -171,7 +172,302 @@ def _prepare_centerline_geometry(
             raise ValueError(
                 "centerline_distances_mm must be finite and nondecreasing."
             )
-    return centerline, spacing, frames_u, frames_v, distances
+        if not np.isclose(distances[0], 0.0, atol=1e-6):
+            raise ValueError("centerline_distances_mm must start at zero.")
+    source_distance_reversed = bool(
+        not preserve_input_order
+        and centerline[-1, 0] > centerline[0, 0]
+    )
+    source_centerline_length_mm = float(distances[-1])
+    if source_distance_reversed:
+        centerline = centerline[::-1].copy()
+        frames_u = frames_u[::-1].copy()
+        frames_v = frames_v[::-1].copy()
+        distances = (
+            source_centerline_length_mm - distances[::-1]
+        ).copy()
+    return (
+        centerline,
+        spacing,
+        frames_u,
+        frames_v,
+        distances,
+        source_distance_reversed,
+        source_centerline_length_mm,
+    )
+
+
+def _orient_point_labels_and_distances(
+    point_labels: Tuple[str, ...],
+    distances_mm: np.ndarray,
+    source_distance_reversed: bool,
+    source_centerline_length_mm: float,
+):
+    """Match source-order labels and distances to z-oriented CPR order."""
+    distances = np.asarray(distances_mm, dtype=float)
+    if not source_distance_reversed:
+        return tuple(point_labels), distances
+    return (
+        tuple(reversed(point_labels)),
+        source_centerline_length_mm - distances[::-1],
+    )
+
+
+def _estimate_endpoint_tangent(
+    centerline_mm: np.ndarray,
+    distances_mm: np.ndarray,
+    at_start: bool,
+    window_mm: float = 5.0,
+) -> np.ndarray:
+    """Estimate an endpoint derivative from a local quadratic fit."""
+    points = np.asarray(centerline_mm, dtype=float)
+    distances = np.asarray(distances_mm, dtype=float)
+    if len(points) < 2:
+        raise ValueError("At least two centerline points are required.")
+
+    distance_span = float(np.max(distances) - np.min(distances))
+    distance_scale = max(
+        1.0,
+        float(np.max(np.abs(distances))),
+    )
+    duplicate_tolerance = max(
+        1e-12 * distance_span,
+        16.0 * np.finfo(float).eps * distance_scale,
+    )
+
+    traversal = (
+        range(len(distances))
+        if at_start
+        else range(len(distances) - 1, -1, -1)
+    )
+    oriented_unique_indices = []
+    for index in traversal:
+        if (
+            not oriented_unique_indices
+            or abs(
+                distances[index]
+                - distances[oriented_unique_indices[-1]]
+            )
+            > duplicate_tolerance
+        ):
+            oriented_unique_indices.append(index)
+    unique_indices = np.sort(
+        np.asarray(oriented_unique_indices, dtype=int)
+    )
+
+    if at_start:
+        endpoint_index = int(unique_indices[0])
+        relative = distances - distances[endpoint_index]
+        indices = unique_indices[
+            relative[unique_indices] <= float(window_mm) + 1e-8
+        ]
+        minimum = min(3, len(unique_indices))
+        if len(indices) < minimum:
+            indices = unique_indices[:minimum]
+        reference_candidates = unique_indices[1:]
+    else:
+        endpoint_index = int(unique_indices[-1])
+        relative = distances - distances[endpoint_index]
+        indices = unique_indices[
+            -relative[unique_indices] <= float(window_mm) + 1e-8
+        ]
+        minimum = min(3, len(unique_indices))
+        if len(indices) < minimum:
+            indices = unique_indices[-minimum:]
+        reference_candidates = unique_indices[-2::-1]
+
+    fit_s = relative[indices]
+    fit_points = points[indices] - points[endpoint_index]
+
+    tangent = np.zeros(3, dtype=float)
+    if len(fit_s) >= 3:
+        scale = float(np.max(np.abs(fit_s)))
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("Centerline endpoint distances are degenerate.")
+        fit_parameter = fit_s / scale
+        design = np.column_stack(
+            [
+                np.ones_like(fit_parameter),
+                fit_parameter,
+                fit_parameter**2,
+            ]
+        )
+        coefficients, _, _, _ = np.linalg.lstsq(
+            design,
+            fit_points,
+            rcond=None,
+        )
+        tangent = coefficients[1]
+
+    reference = None
+    for index in reference_candidates:
+        candidate = (
+            points[index] - points[endpoint_index]
+            if at_start
+            else points[endpoint_index] - points[index]
+        )
+        if np.linalg.norm(candidate) > 1e-8:
+            reference = candidate
+            break
+    if reference is None:
+        raise ValueError("Centerline endpoints do not define a direction.")
+    if len(fit_s) < 3:
+        tangent = reference
+    elif np.linalg.norm(tangent) <= 1e-8:
+        raise ValueError(
+            "Local quadratic fit produced a degenerate endpoint tangent."
+        )
+    elif np.dot(tangent, reference) < 0:
+        tangent = -tangent
+    tangent_norm = float(np.linalg.norm(tangent))
+    if not np.isfinite(tangent_norm) or tangent_norm <= 1e-8:
+        raise ValueError("Centerline endpoint tangent is degenerate.")
+    return tangent / tangent_norm
+
+
+def _extend_centerline_geometry(
+    centerline_voxel_zyx: np.ndarray,
+    spacing_zyx: np.ndarray,
+    frames_u_zyx: np.ndarray,
+    frames_v_zyx: np.ndarray,
+    distances_mm: np.ndarray,
+    start_extension_mm: float,
+    end_extension_mm: float,
+):
+    """Extend the anatomical start at index 0 and end at index -1."""
+    extensions = np.asarray(
+        [start_extension_mm, end_extension_mm],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(extensions)) or np.any(extensions < 0):
+        raise ValueError(
+            "CPR endpoint extensions must be finite and nonnegative."
+        )
+    if np.all(extensions == 0):
+        return (
+            centerline_voxel_zyx,
+            frames_u_zyx,
+            frames_v_zyx,
+            distances_mm,
+        )
+
+    centerline = np.asarray(centerline_voxel_zyx, dtype=float)
+    spacing = np.asarray(spacing_zyx, dtype=float)
+    frames_u = np.asarray(frames_u_zyx, dtype=float)
+    frames_v = np.asarray(frames_v_zyx, dtype=float)
+    distances = np.asarray(distances_mm, dtype=float)
+    positive_steps = np.diff(distances)
+    positive_steps = positive_steps[positive_steps > 1e-8]
+    if positive_steps.size:
+        step_mm = float(np.median(positive_steps))
+    else:
+        segment_lengths = np.linalg.norm(
+            np.diff(centerline * spacing, axis=0),
+            axis=1,
+        )
+        segment_lengths = segment_lengths[segment_lengths > 1e-8]
+        if not segment_lengths.size:
+            raise ValueError("Centerline endpoints do not define a direction.")
+        step_mm = float(np.median(segment_lengths))
+
+    centerline_mm = centerline * spacing
+    first_direction = (
+        _estimate_endpoint_tangent(
+            centerline_mm,
+            distances,
+            at_start=True,
+        )
+        if start_extension_mm > 0
+        else np.zeros(3, dtype=float)
+    )
+    last_direction = (
+        _estimate_endpoint_tangent(
+            centerline_mm,
+            distances,
+            at_start=False,
+        )
+        if end_extension_mm > 0
+        else np.zeros(3, dtype=float)
+    )
+
+    def extension_offsets(length_mm: float, before_start: bool):
+        if length_mm == 0:
+            return np.empty(0, dtype=float)
+        count = max(1, int(np.ceil(length_mm / step_mm)))
+        if before_start:
+            return np.linspace(-length_mm, -length_mm / count, count)
+        return np.linspace(length_mm / count, length_mm, count)
+
+    first_offsets = extension_offsets(float(start_extension_mm), True)
+    last_offsets = extension_offsets(float(end_extension_mm), False)
+    first_points_mm = (
+        centerline_mm[0]
+        + first_offsets[:, None] * first_direction[None, :]
+    )
+    last_points_mm = (
+        centerline_mm[-1]
+        + last_offsets[:, None] * last_direction[None, :]
+    )
+    extended_centerline = np.concatenate(
+        (
+            first_points_mm / spacing,
+            centerline,
+            last_points_mm / spacing,
+        ),
+        axis=0,
+    )
+    extended_frames_u = np.concatenate(
+        (
+            np.repeat(frames_u[:1], len(first_offsets), axis=0),
+            frames_u,
+            np.repeat(frames_u[-1:], len(last_offsets), axis=0),
+        ),
+        axis=0,
+    )
+    extended_frames_v = np.concatenate(
+        (
+            np.repeat(frames_v[:1], len(first_offsets), axis=0),
+            frames_v,
+            np.repeat(frames_v[-1:], len(last_offsets), axis=0),
+        ),
+        axis=0,
+    )
+    extended_distances = np.concatenate(
+        (
+            distances[0] + first_offsets,
+            distances,
+            distances[-1] + last_offsets,
+        )
+    )
+    return (
+        extended_centerline,
+        extended_frames_u,
+        extended_frames_v,
+        extended_distances,
+    )
+
+
+def _extend_point_labels(
+    point_labels: Tuple[str, ...],
+    original_distances_mm: np.ndarray,
+    extended_distances_mm: np.ndarray,
+) -> Tuple[str, ...]:
+    """Repeat endpoint labels for virtual centerline extension points."""
+    if not point_labels:
+        return point_labels
+    original_distances = np.asarray(original_distances_mm, dtype=float)
+    extended_distances = np.asarray(extended_distances_mm, dtype=float)
+    start_count = int(
+        np.count_nonzero(extended_distances < original_distances[0] - 1e-8)
+    )
+    end_count = int(
+        np.count_nonzero(extended_distances > original_distances[-1] + 1e-8)
+    )
+    return (
+        (point_labels[0],) * start_count
+        + tuple(point_labels)
+        + (point_labels[-1],) * end_count
+    )
 
 
 def generate_centerline_cpr(
@@ -189,11 +485,22 @@ def generate_centerline_cpr(
     name: str = "centerline",
     curve_resolution_mm: float | None = None,
     centerline_smoothing_sigma_mm: float = 0.8,
+    start_extension_mm: float = 15.0,
+    end_extension_mm: float = 15.0,
+    preserve_input_order: bool = False,
 ) -> CPRResult:
     """Generate CPR directly from an ordered centerline, without detection."""
     if not np.isfinite(distance_from_root_mm):
         raise ValueError("distance_from_root_mm must be finite.")
-    centerline, spacing, frames_u, frames_v, distances = (
+    (
+        centerline,
+        spacing,
+        frames_u,
+        frames_v,
+        distances,
+        source_distance_reversed,
+        source_centerline_length_mm,
+    ) = (
         _prepare_centerline_geometry(
             centerline_voxel_zyx,
             spacing_zyx,
@@ -202,6 +509,18 @@ def generate_centerline_cpr(
             centerline_distances_mm,
             curve_resolution_mm,
             centerline_smoothing_sigma_mm,
+            preserve_input_order,
+        )
+    )
+    centerline, frames_u, frames_v, distances = (
+        _extend_centerline_geometry(
+            centerline,
+            spacing,
+            frames_u,
+            frames_v,
+            distances,
+            start_extension_mm,
+            end_extension_mm,
         )
     )
 
@@ -217,16 +536,25 @@ def generate_centerline_cpr(
         interpolation_order=interpolation_order,
     )
     label = str(name) or "centerline"
+    distances_from_root = (
+        float(distance_from_root_mm)
+        + source_centerline_length_mm
+        - distances
+        if source_distance_reversed
+        else distances + float(distance_from_root_mm)
+    )
     return CPRResult(
         image=cpr_image,
         centerline_distances_mm=distances,
-        distances_from_root_mm=distances + float(distance_from_root_mm),
+        distances_from_root_mm=distances_from_root,
         offsets_mm=offsets,
         angle_degrees=float(angle_degrees),
         branch_id=label,
         anatomical_label=label,
         point_anatomical_labels=tuple(label for _ in centerline),
         sampling_line_length_mm=2.0 * float(radius_mm),
+        source_distance_reversed=source_distance_reversed,
+        source_centerline_length_mm=source_centerline_length_mm,
     )
 
 
@@ -247,6 +575,9 @@ def generate_stretched_cpr(
     centerline_smoothing_sigma_mm: float = 0.8,
     vector_of_interest_zyx: np.ndarray | None = None,
     image_direction_xyz: Sequence[float] | np.ndarray | None = None,
+    start_extension_mm: float = 15.0,
+    end_extension_mm: float = 15.0,
+    preserve_input_order: bool = False,
 ) -> CPRResult:
     """Generate stretched CPR using one global patient-LPS direction."""
     if not np.isfinite(distance_from_root_mm):
@@ -261,7 +592,15 @@ def generate_stretched_cpr(
     if interpolation_order < 0 or interpolation_order > 5:
         raise ValueError("interpolation_order must be between 0 and 5.")
 
-    centerline, spacing, frames_u, frames_v, distances = (
+    (
+        centerline,
+        spacing,
+        frames_u,
+        frames_v,
+        distances,
+        source_distance_reversed,
+        source_centerline_length_mm,
+    ) = (
         _prepare_centerline_geometry(
             centerline_voxel_zyx,
             spacing_zyx,
@@ -270,6 +609,18 @@ def generate_stretched_cpr(
             centerline_distances_mm,
             curve_resolution_mm,
             centerline_smoothing_sigma_mm,
+            preserve_input_order,
+        )
+    )
+    centerline, frames_u, frames_v, distances = (
+        _extend_centerline_geometry(
+            centerline,
+            spacing,
+            frames_u,
+            frames_v,
+            distances,
+            start_extension_mm,
+            end_extension_mm,
         )
     )
     if vector_of_interest_zyx is None:
@@ -362,18 +713,19 @@ def generate_stretched_cpr(
         cval=cval,
         prefilter=interpolation_order > 1,
     )
-    valid_sampling_line = np.abs(line_parameters) <= radius_mm + 1e-8
-    stretched_image = np.where(
-        valid_sampling_line,
-        stretched_image,
-        cval,
-    )
 
     label = str(name) or "centerline"
+    distances_from_root = (
+        float(distance_from_root_mm)
+        + source_centerline_length_mm
+        - distances
+        if source_distance_reversed
+        else distances + float(distance_from_root_mm)
+    )
     return CPRResult(
         image=stretched_image,
         centerline_distances_mm=distances,
-        distances_from_root_mm=distances + float(distance_from_root_mm),
+        distances_from_root_mm=distances_from_root,
         offsets_mm=display_x,
         angle_degrees=float(angle_degrees),
         branch_id=label,
@@ -391,6 +743,8 @@ def generate_stretched_cpr(
             float(value) for value in line_direction_lps
         ),
         sampling_line_length_mm=float(sampling_line_length_mm),
+        source_distance_reversed=source_distance_reversed,
+        source_centerline_length_mm=source_centerline_length_mm,
     )
 
 
@@ -412,6 +766,8 @@ def generate_label_cprs(
     interpolation_order: int = 1,
     mode: str = "straightened",
     image_direction_xyz: Sequence[float] | np.ndarray | None = None,
+    start_extension_mm: float = 15.0,
+    end_extension_mm: float = 15.0,
 ) -> list[CPRResult]:
     """Extract centerline trees from a label and generate CPR images."""
     from ..centerline import extract_centerline_tree
@@ -433,6 +789,14 @@ def generate_label_cprs(
         or sampling_line_length_mm <= 0
     ):
         raise ValueError("sampling_line_length_mm must be positive and finite.")
+    extensions = np.asarray(
+        [start_extension_mm, end_extension_mm],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(extensions)) or np.any(extensions < 0):
+        raise ValueError(
+            "CPR endpoint extensions must be finite and nonnegative."
+        )
     angles = [float(angle) for angle in angles_degrees]
     if not angles or any(not np.isfinite(angle) for angle in angles):
         raise ValueError("angles_degrees must contain finite values.")
@@ -494,6 +858,8 @@ def generate_label_cprs(
                         pixel_mm=pixel_mm,
                         interpolation_order=interpolation_order,
                         name=branch_label,
+                        start_extension_mm=start_extension_mm,
+                        end_extension_mm=end_extension_mm,
                     )
                 else:
                     cpr = generate_stretched_cpr(
@@ -508,12 +874,27 @@ def generate_label_cprs(
                         interpolation_order=interpolation_order,
                         name=branch_label,
                         image_direction_xyz=image_direction_xyz,
+                        start_extension_mm=start_extension_mm,
+                        end_extension_mm=end_extension_mm,
                     )
+                oriented_labels, oriented_distances = (
+                    _orient_point_labels_and_distances(
+                        point_labels,
+                        branch.distances_mm,
+                        cpr.source_distance_reversed,
+                        float(cpr.source_centerline_length_mm),
+                    )
+                )
+                extended_point_labels = _extend_point_labels(
+                    oriented_labels,
+                    oriented_distances,
+                    cpr.centerline_distances_mm,
+                )
                 results.append(
                     replace(
                         cpr,
                         branch_id=f"{vessel}-B{branch.branch_id:03d}",
-                        point_anatomical_labels=point_labels,
+                        point_anatomical_labels=extended_point_labels,
                     )
                 )
     if not results:
@@ -553,34 +934,40 @@ def generate_branch_cpr(
         [item.frame_v_zyx for item in branch.measurements],
         dtype=float,
     )
-    cpr_image, offsets = sample_cpr(
+    source_distances = np.asarray(
+        [item.distance_mm for item in branch.measurements],
+        dtype=float,
+    )
+    local_distances = source_distances - source_distances[0]
+    cpr = generate_centerline_cpr(
         image=image,
-        centers_voxel_zyx=centers,
-        frames_u_zyx=frames_u,
-        frames_v_zyx=frames_v,
+        centerline_voxel_zyx=centers,
         spacing_zyx=spacing_zyx,
         angle_degrees=angle_degrees,
+        frames_u_zyx=frames_u,
+        frames_v_zyx=frames_v,
+        centerline_distances_mm=local_distances,
+        distance_from_root_mm=float(
+            branch.measurements[0].distance_from_root_mm
+        ),
         radius_mm=radius_mm,
         pixel_mm=pixel_mm,
         interpolation_order=interpolation_order,
+        name=branch.anatomical_label or branch.branch_id,
+        start_extension_mm=0.0,
+        end_extension_mm=0.0,
     )
-    return CPRResult(
-        image=cpr_image,
-        centerline_distances_mm=np.asarray(
-            [item.distance_mm for item in branch.measurements],
-            dtype=float,
-        ),
-        distances_from_root_mm=np.asarray(
-            [item.distance_from_root_mm for item in branch.measurements],
-            dtype=float,
-        ),
-        offsets_mm=offsets,
-        angle_degrees=float(angle_degrees),
+    point_labels, _ = _orient_point_labels_and_distances(
+        tuple(item.anatomical_label for item in branch.measurements),
+        local_distances,
+        cpr.source_distance_reversed,
+        float(cpr.source_centerline_length_mm),
+    )
+    return replace(
+        cpr,
         branch_id=branch.branch_id,
         anatomical_label=branch.anatomical_label,
-        point_anatomical_labels=tuple(
-            item.anatomical_label for item in branch.measurements
-        ),
+        point_anatomical_labels=point_labels,
     )
 
 
@@ -725,6 +1112,8 @@ def generate_branch_cprs(
             distance_from_root_mm=first_root_distance,
             interpolation_order=config.interpolation_order,
             name=branch.anatomical_label or branch.branch_id,
+            start_extension_mm=config.start_extension_mm,
+            end_extension_mm=config.end_extension_mm,
         )
         if config.mode.lower() == "straightened":
             cpr = generate_centerline_cpr(
@@ -739,12 +1128,25 @@ def generate_branch_cprs(
                 slice_resolution_mm=config.slice_resolution_mm,
                 image_direction_xyz=image_direction_xyz,
             )
+        oriented_labels, oriented_distances = (
+            _orient_point_labels_and_distances(
+                point_labels,
+                distances,
+                cpr.source_distance_reversed,
+                float(cpr.source_centerline_length_mm),
+            )
+        )
+        extended_point_labels = _extend_point_labels(
+            oriented_labels,
+            oriented_distances,
+            cpr.centerline_distances_mm,
+        )
         results.append(
             replace(
                 cpr,
                 branch_id=branch.branch_id,
                 anatomical_label=branch.anatomical_label or branch.branch_id,
-                point_anatomical_labels=point_labels,
+                point_anatomical_labels=extended_point_labels,
             )
         )
     return results

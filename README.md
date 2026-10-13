@@ -344,6 +344,8 @@ results = run_cpr(
     curve_resolution_mm=1.0,
     slice_resolution_mm=1.0,
     sampling_line_length_mm=40.0,
+    start_extension_mm=15.0,
+    end_extension_mm=15.0,
     stenosis_result_path=(
         r"E:\data\NarrowResult\stenosis_result.json"
     ),  # 可省略；提供后在 CPR 中标注狭窄候选
@@ -367,6 +369,8 @@ results = run_cpr(
     curve_resolution_mm=1.0,
     slice_resolution_mm=1.0,
     sampling_line_length_mm=40.0,
+    start_extension_mm=15.0,
+    end_extension_mm=15.0,
     name="LAD",
 )
 ```
@@ -402,6 +406,8 @@ run_cpr(
     min_branch_mean_radius_mm=0.4,
     max_branch_order=None,
     stenosis_result_path=None,
+    start_extension_mm=15.0,
+    end_extension_mm=15.0,
 )
 ```
 
@@ -413,14 +419,20 @@ run_cpr(
 | `angles_degrees` | `(0.0,)` | CPR 观察角度，可一次生成多个角度 |
 | `curve_resolution_mm` | `1.0` | 沿中心线的重采样间距 |
 | `slice_resolution_mm` | `1.0` | 沿采样线及 stretched 画布的像素间距 |
-| `sampling_line_length_mm` | `40.0` | 以中心线点为中心的采样线长度 |
+| `sampling_line_length_mm` | `40.0` | 全局左右边界在曲线极值外的总扩展量，即左右各扩展一半 |
+| `start_extension_mm` | `15.0` | 血管解剖起点一侧向外延伸的采样长度；设为 `0` 可关闭 |
+| `end_extension_mm` | `15.0` | 血管解剖终点一侧向外延伸的采样长度；设为 `0` 可关闭 |
 | `interpolation_order` | `1` | `scipy.ndimage.map_coordinates` 插值阶数，范围 `0-5` |
 | `save_outputs` | `True` | 是否保存 PNG；为 `False` 时可不提供 `output_dir` |
 | `stenosis_result_path` | `None` | 可选狭窄检测 JSON；提供后按分支在 CPR 中标注候选 |
 
 `sampling_line_length_mm` 是 CPR 应暴露给交互界面的采样宽度。狭窄检测中的 `cross_section_radius_mm` 则控制二维横截面分析窗口，两者互不影响。
 
-传入已有中心线时，还可同时提供匹配的 `frames_u_zyx`、`frames_v_zyx` 和 `centerline_distances_mm`。`frames_u_zyx` 与 `frames_v_zyx` 必须成对提供；若提供显式框架或距离数组，`run_cpr` 不再自动重采样这条中心线。
+两种 CPR 模式使用同一个端点规则：比较 `centerline_voxel_zyx` 两个 endpoint 的第一个坐标（voxel z），z 较大的 endpoint 是起点，另一个是终点；两端 z 相等时保持输入顺序。采样前会按“起点到终点”统一中心线方向，显式 frame、距离、分段标签和狭窄候选位置也会同步换向。
+
+两种 CPR 模式默认都会将起点和终点分别向外延伸 `15 mm`，以显示血管两端之外的组织。延伸方向不是由端点旁的单个线段决定，而是在每一端约 `5 mm` 的中心线邻域内使用至少 3 个点做局部二次拟合，并取端点导数；中心线总共只有 2 个有效点时才退化为两点方向。起点延伸段使用负距离，终点延伸段使用大于原中心线长度的距离。延伸段只参与 CPR 采样，不修改原始中心线或解剖位置；超出原始三维影像范围的采样点使用影像最低有限强度填充。
+
+传入已有中心线时，还可同时提供匹配的 `frames_u_zyx`、`frames_v_zyx` 和 `centerline_distances_mm`。`frames_u_zyx` 与 `frames_v_zyx` 必须成对提供，`centerline_distances_mm` 必须从 `0` 开始且非递减；若提供显式框架或距离数组，`run_cpr` 不再自动重采样这条中心线。
 
 ### 11.4 与狭窄检测结果联动
 
@@ -475,6 +487,8 @@ result = run_combined(
         curve_resolution_mm=1.0,
         slice_resolution_mm=1.0,
         sampling_line_length_mm=40.0,
+        start_extension_mm=15.0,
+        end_extension_mm=15.0,
         analyze_side_branches=False,
     ),
     print_summary=True,
@@ -505,6 +519,8 @@ l_i(phi) = cos(phi) * u_i + sin(phi) * v_i
 - 纵轴：沿采样线的有符号偏移。
 - 图中 `y=0`：三维中心线。
 
+保存的 PNG 按“z 较大的 endpoint 到另一个 endpoint”从左向右显示。显示路径的最左端为 `0 mm`；启用起点延伸时，该位置是延伸段的外端，原始起点位于其后 `start_extension_mm` 处。`CPRResult` 的图像、中心线距离和逐点标签均使用这一统一方向；外部狭窄结果仍保持原值，仅在绘图时映射到统一方向。
+
 这里的 `(u_i, v_i)` 位于垂直于该点中心线切向量的平面中。它们由第一点的初始横截面基向量开始，通过平行运输沿整条中心线传播，以减少逐点坐标系突然翻转。
 
 ## 14. Stretched CPR
@@ -531,13 +547,13 @@ x_(i+1) = x_i + dx_i
 y_(i+1) = y_i + dy_i
 ```
 
-因此相邻中心线点在展开图上的距离仍等于三维物理距离。主干从 root 开始，首点定义为 `(0, 0)`；侧支结果以该侧支自己的起点作为局部起点。
+因此相邻中心线点在展开图上的距离仍等于三维物理距离。保存 PNG 时，将显示路径的起点放在图像顶部并定义为 `(0, 0)`，纵坐标从上向下增大，终点显示在下方；启用起点延伸时，顶部起点是延伸段的外端。
 
 最终图像不是用二维中心线点重新寻找三维位置，而是保持 `P_i` 与二维位置 `Q_i` 的既定对应。画布上每一行沿同一个全局 vector-of-interest 回到原始三维图像采样，并在相邻采样行之间插值形成连续图像。
 
 ### Stretched 画布宽度
 
-stretched 模式的横向画布需要容纳二维中心线在 vector-of-interest 方向上的累计位移，因此可能宽于 `sampling_line_length_mm`。每一行只保留以对应中心线点为中心、长度为 `sampling_line_length_mm` 的有效采样；该范围之外的画布像素保持为背景值。
+stretched 模式的横向画布由二维中心线在 vector-of-interest 方向上的最左、最右位置确定，并在两侧各扩展 `sampling_line_length_mm / 2`，因此能够覆盖完整矩形画布，不再按每一行的局部采样带裁成黑边。
 
 ## 15. CPR 输出
 
@@ -566,6 +582,8 @@ stretched 模式的横向画布需要容纳二维中心线在 vector-of-interest
 | `vector_of_interest_zyx` | 图像数组坐标中的全局采样方向 |
 | `vector_of_interest_lps_xyz` | 患者 LPS 坐标中的全局采样方向 |
 | `sampling_line_length_mm` | 请求的采样线长度 |
+| `source_distance_reversed` | 输入中心线是否因 endpoint z 规则被反转 |
+| `source_centerline_length_mm` | 反转候选距离时使用的原中心线长度 |
 
 stretched JPG 中：
 
@@ -590,7 +608,54 @@ stretched JPG 中：
 
 数组级接口按功能位于 `NarrowDetecter.centerline`、`NarrowDetecter.detection` 和 `NarrowDetecter.cpr` 子包中，不再从包根目录导出。
 
-## 17. 常见问题
+## 17. 手工中心线 CPR 交互界面
+
+交互界面不需要血管 mask。用户直接在三视图上按点击顺序标注一条或多条路径，每条路径都可以独立保存为本程序 JSON，并生成 stretched 或 straightened CPR。
+
+三视图始终沿原始影像数组的整数索引显示切片：轴位为 `array_zyx[k, :, :]`、冠状位为 `array_zyx[:, j, :]`、矢状位为 `array_zyx[:, :, i]`。竖向跟随数组轴正方向，横向相对原始数组左右镜像；不额外重排为标准解剖方位。点击和拖动仍对应屏幕上的位置，中心点依旧以 LPS 物理坐标保存，CPR 与中心线 JSON 的坐标格式不变。
+
+### 17.1 安装与启动
+
+在已经配置好的 `myenv` 中安装可选 GUI 依赖：
+
+```powershell
+conda activate myenv
+cd E:\ZZR\Code
+python -m pip install -r NarrowDetecter\requirements-gui.txt
+python -m NarrowDetecter.gui
+```
+
+GUI 依赖包括 PySide6 和 VTK，不会被包根目录自动导入，因此原有无 GUI 的算法调用不受影响。
+
+### 17.2 推荐工作流
+
+1. 从“导入影像”菜单选择一个 NIfTI 文件或 DICOM 文件夹；DICOM 文件夹包含多个序列时必须手工选择序列。
+2. 在任意三视图逐层点击中心点。点的点击顺序就是 CPR 的起点到终点顺序，程序不会再根据 z 坐标反转手工路径。
+3. 用“新建路径”创建下一条路径。路径名称完全由用户决定，不要求是 LAD、LCX 或 RCA；多条路径可以共享同一空间点。
+4. 可随时将当前路径导出为 JSON，之后重新导入并继续编辑。
+5. 为当前活动路径设置模式、角度范围、采样宽度、输出分辨率和是否显示中心线，选择输出目录后点击 Start。默认生成 `0, 15, ..., 165` 共 12 个角度。
+
+每次 Start 只处理当前活动路径，输出到 `<输出目录>/<路径名>/`，其中包含模式和角度明确标识的 PNG 以及该路径的中心线 JSON。已有同名完整结果只会在用户确认后覆盖；计算先写入临时目录，取消或失败不会把不完整结果冒充为完成结果。
+
+### 17.3 鼠标操作
+
+- 左键单击空白位置：在当前切面和活动路径末尾追加中心点。
+- 左键按住活动路径已有点并拖动：只修改当前数组切面内的两个坐标，保持该点原来的数组层号不变。
+- 右键活动路径已有点：选择“删除该点”或“清空路径”。
+- 滚轮：沿当前视图的原始数组轴逐次切换一个整数层号。
+- `Ctrl + 滚轮`：缩放。
+- 按住鼠标中键拖动：平移。
+- 双击视图：在单视图最大化和三视图之间切换；双击不会添加中心点。
+
+只有活动路径可编辑。隐藏/显示其他路径不会切换活动路径，点击非活动路径的点也不会自动切换或移动它。
+
+### 17.4 中心线 JSON 与参数约定
+
+JSON 使用本程序格式 `narrowdetecter-centerline`，坐标为物理空间 LPS 毫米，分别保存每条路径的原始手工控制点、影像几何和常用 CPR 参数。它不承诺兼容 3D Slicer Markups 格式。导入时如果影像几何不一致，界面会要求用户明确确认。
+
+交互路径固定使用 `0.5 mm` 曲线重采样、`0.8 mm` 平滑和线性插值；起点与终点延伸均固定为 `0 mm`，界面不提供端点延伸或其他高级参数。这样 CPR 严格以用户实际点击的首点和末点为边界。
+
+## 18. 常见问题
 
 ### 中心线方向看起来反了怎么办？
 

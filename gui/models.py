@@ -266,6 +266,7 @@ class PathStore:
         point_index: int,
         orientation: str,
         new_lps: Sequence[float],
+        geometry: ImageGeometry,
     ) -> None:
         path = self._require_active(path_id)
         normal_axis = {"sagittal": 0, "coronal": 1, "axial": 2}
@@ -274,9 +275,12 @@ class PathStore:
         except KeyError as error:
             raise ValueError(f"Unsupported orientation: {orientation}") from error
         old = path.control_points_lps_mm[point_index]
-        moved = list(_finite_triplet(new_lps, "new_lps"))
-        moved[axis] = old[axis]
-        path.control_points_lps_mm[point_index] = tuple(moved)
+        moved_index = list(geometry.lps_to_continuous_index_xyz(new_lps))
+        old_index = geometry.lps_to_continuous_index_xyz(old)
+        moved_index[axis] = old_index[axis]
+        path.control_points_lps_mm[point_index] = (
+            geometry.continuous_index_xyz_to_lps(moved_index)
+        )
         path.dirty = True
 
     def delete_point(self, path_id: str, point_index: int) -> None:
