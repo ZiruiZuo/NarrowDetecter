@@ -245,6 +245,21 @@ class PathStore:
     def set_visibility(self, path_id: str, visible: bool) -> None:
         self.get_path(path_id).visible = bool(visible)
 
+    def delete_path(self, path_id: str) -> None:
+        self.get_path(path_id)
+        path_ids = list(self._paths)
+        deleted_index = path_ids.index(path_id)
+        del self._paths[path_id]
+        if self._active_path_id != path_id:
+            return
+        remaining_ids = list(self._paths)
+        if not remaining_ids:
+            self._active_path_id = None
+        elif deleted_index < len(remaining_ids):
+            self._active_path_id = remaining_ids[deleted_index]
+        else:
+            self._active_path_id = remaining_ids[-1]
+
     def _require_active(self, path_id: str | None = None) -> ControlPath:
         path = self.active_path
         if path is None:

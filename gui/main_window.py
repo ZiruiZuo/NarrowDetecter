@@ -8,9 +8,7 @@ import numpy as np
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QDoubleSpinBox,
     QFileDialog,
-    QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -50,19 +48,21 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: CPRWorker | None = None
         self._running_path_id: str | None = None
+        self._display_window = 1.0
+        self._display_level = 0.0
 
         self.path_panel = PathPanel(self)
         self.viewer = viewer_factory()
         self.cpr_panel = CPRPanel(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.addWidget(self.path_panel)
-        splitter.addWidget(self.viewer)
-        splitter.addWidget(self.cpr_panel)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
-        splitter.setSizes([240, 1000, 300])
-        self.setCentralWidget(splitter)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter.addWidget(self.path_panel)
+        self.splitter.addWidget(self.viewer)
+        self.splitter.addWidget(self.cpr_panel)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setSizes([240, 1000, 300])
+        self.setCentralWidget(self.splitter)
 
         self._create_actions()
         self._create_toolbar()
@@ -101,30 +101,31 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.import_centerline_action)
         toolbar.addAction(self.export_centerline_action)
         toolbar.addSeparator()
-
-        toolbar.addWidget(QLabel("窗宽 ", toolbar))
-        self.window_spin = QDoubleSpinBox(toolbar)
-        self.window_spin.setDecimals(2)
-        self.window_spin.setRange(0.001, 1e12)
-        self.window_spin.setValue(1.0)
-        toolbar.addWidget(self.window_spin)
-        toolbar.addWidget(QLabel(" 窗位 ", toolbar))
-        self.level_spin = QDoubleSpinBox(toolbar)
-        self.level_spin.setDecimals(2)
-        self.level_spin.setRange(-1e12, 1e12)
-        toolbar.addWidget(self.level_spin)
-        self.window_spin.valueChanged.connect(self._apply_window_level)
-        self.level_spin.valueChanged.connect(self._apply_window_level)
+        self.window_level_button = QToolButton(toolbar)
+        self.window_level_button.setObjectName("windowLevelToolButton")
+        self.window_level_button.setText("亮度/对比度")
+        self.window_level_button.setCheckable(True)
+        self.window_level_button.setToolTip(
+            "启用后按住中键：上下调整亮度，左右调整对比度"
+        )
+        self.window_level_button.toggled.connect(
+            self._set_window_level_adjustment_enabled
+        )
+        toolbar.addWidget(self.window_level_button)
 
     def _connect_signals(self) -> None:
         self.path_panel.create_requested.connect(self.create_path)
         self.path_panel.active_path_requested.connect(self.set_active_path)
         self.path_panel.rename_requested.connect(self._rename_path)
         self.path_panel.visibility_changed.connect(self._set_path_visibility)
+        self.path_panel.delete_requested.connect(self._delete_path)
         self.viewer.point_append_requested.connect(self._append_point)
         self.viewer.point_move_requested.connect(self._move_point)
         self.viewer.point_delete_requested.connect(self._delete_point)
         self.viewer.path_clear_requested.connect(self._clear_path)
+        self.viewer.window_level_adjust_requested.connect(
+            self._on_window_level_adjust_requested
+        )
         self.cpr_panel.start_requested.connect(self.start_cpr)
         self.cpr_panel.cancel_requested.connect(self.cancel_cpr)
 
@@ -181,6 +182,27 @@ class MainWindow(QMainWindow):
         self.path_store.set_visibility(path_id, visible)
         self.viewer.set_paths(self.path_store.paths, self.path_store.active_path_id)
 
+    def _delete_path(self, path_id: str) -> None:
+        try:
+            path = self.path_store.get_path(path_id)
+        except KeyError:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除路径",
+            f"确定删除路径“{path.name}”及其全部中心点吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        deleted_active_path = path_id == self.path_store.active_path_id
+        self.path_store.delete_path(path_id)
+        active_path = self.path_store.active_path
+        if deleted_active_path and active_path is not None:
+            self.cpr_panel.set_settings(active_path.cpr_settings)
+        self._refresh_paths()
+
     def _append_point(self, orientation: str, point_lps) -> None:
         del orientation
         if self.volume is None or self.path_store.active_path is None:
@@ -223,11 +245,17 @@ class MainWindow(QMainWindow):
         self._refresh_paths()
 
     def set_loaded_volume(self, volume: LoadedVolume) -> None:
+        self.window_level_button.setChecked(False)
+        self._set_window_level_adjustment_enabled(False)
         self.volume = volume
         self.path_store = PathStore()
+        self._refresh_paths()
         self.viewer.set_volume(volume)
-        values = np.asarray(volume.array_zyx, dtype=float)
-        finite = values[np.isfinite(values)]
+        values = np.asarray(volume.array_zyx).reshape(-1)
+        maximum_samples = 1_000_000
+        stride = max(1, (values.size + maximum_samples - 1) // maximum_samples)
+        sample = values[::stride]
+        finite = sample[np.isfinite(sample)]
         if finite.size:
             low, high = np.percentile(finite, (1.0, 99.0))
             if not np.isfinite(high - low) or high <= low:
@@ -235,19 +263,39 @@ class MainWindow(QMainWindow):
                 high = float(finite.max()) + 0.5
         else:
             low, high = 0.0, 1.0
-        self.window_spin.blockSignals(True)
-        self.level_spin.blockSignals(True)
-        self.window_spin.setValue(max(0.001, float(high - low)))
-        self.level_spin.setValue(float((high + low) * 0.5))
-        self.window_spin.blockSignals(False)
-        self.level_spin.blockSignals(False)
+        self._display_window = max(0.001, float(high - low))
+        self._display_level = float((high + low) * 0.5)
         self._apply_window_level()
         self.create_path()
         self.statusBar().showMessage(f"已载入：{volume.source_path}")
 
     def _apply_window_level(self) -> None:
         self.viewer.set_window_level(
-            self.window_spin.value(), self.level_spin.value()
+            self._display_window, self._display_level
+        )
+
+    def _set_window_level_adjustment_enabled(self, enabled: bool) -> None:
+        self.viewer.set_window_level_adjustment_enabled(bool(enabled))
+        if enabled:
+            self.statusBar().showMessage(
+                "亮度/对比度调整模式：中键上下调整亮度，左右调整对比度"
+            )
+        else:
+            self.statusBar().showMessage("普通模式：中键拖动平移")
+
+    def _on_window_level_adjust_requested(
+        self,
+        window: float,
+        level: float,
+    ) -> None:
+        if not np.isfinite(window) or not np.isfinite(level):
+            return
+        self._display_window = max(0.001, float(window))
+        self._display_level = float(level)
+        self._apply_window_level()
+        self.statusBar().showMessage(
+            f"亮度/对比度调整：窗宽 {self._display_window:.2f}，"
+            f"窗位 {self._display_level:.2f}"
         )
 
     def _choose_nifti(self) -> None:
@@ -454,7 +502,8 @@ class MainWindow(QMainWindow):
                 self.path_store.mark_exported(self._running_path_id)
             except KeyError:
                 pass
-        self.cpr_panel.set_status(f"完成：{output}")
+        self.cpr_panel.set_status("完成")
+        self.statusBar().showMessage(f"CPR 已完成：{output}")
         self._refresh_paths()
         self._set_busy(False)
 
@@ -504,6 +553,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self._confirm_dirty_paths():
+            self.viewer.close()
             event.accept()
         else:
             event.ignore()

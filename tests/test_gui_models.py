@@ -146,6 +146,28 @@ class PathStoreTests(unittest.TestCase):
         self.assertFalse(first.visible)
         self.assertEqual(store.active_path_id, second.path_id)
 
+    def test_deleting_paths_selects_the_next_neighbor_then_allows_empty_store(self):
+        store = PathStore()
+        first = store.create_path()
+        second = store.create_path()
+        third = store.create_path()
+        store.set_active(second.path_id)
+
+        store.delete_path(second.path_id)
+
+        self.assertEqual(
+            tuple(path.path_id for path in store.paths),
+            (first.path_id, third.path_id),
+        )
+        self.assertEqual(store.active_path_id, third.path_id)
+
+        store.delete_path(first.path_id)
+        self.assertEqual(store.active_path_id, third.path_id)
+
+        store.delete_path(third.path_id)
+        self.assertEqual(store.paths, ())
+        self.assertIsNone(store.active_path_id)
+
     def test_move_in_view_preserves_plane_normal_coordinate(self):
         normal_axis = {"sagittal": 0, "coronal": 1, "axial": 2}
         for orientation, axis in normal_axis.items():

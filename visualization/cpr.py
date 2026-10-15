@@ -212,7 +212,7 @@ def _write_cpr_result(
     candidates = _orient_candidates_for_cpr(cpr, candidates)
     finite = cpr.image[np.isfinite(cpr.image)]
     low, high = (
-        np.percentile(finite, (1, 99))
+        np.percentile(finite, (1, 99.9))
         if finite.size
         else (0.0, 1.0)
     )
@@ -239,7 +239,7 @@ def _write_cpr_result(
             ],
             vmin=float(low),
             vmax=float(high),
-            interpolation="nearest",
+            interpolation="bilinear",
         )
         if show_centerline:
             axes.plot(
@@ -312,7 +312,7 @@ def _write_cpr_result(
             ],
             vmin=float(low),
             vmax=float(high),
-            interpolation="nearest",
+            interpolation="bilinear",
         )
         for candidate in candidates:
             axes.axvspan(

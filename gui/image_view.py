@@ -5,11 +5,18 @@ from collections.abc import Sequence
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent, QWheelEvent
-from PySide6.QtWidgets import QApplication, QMenu, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QMenu,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPlane, vtkPolyData
-from vtkmodules.vtkFiltersSources import vtkLineSource, vtkSphereSource
+from vtkmodules.vtkFiltersSources import vtkLineSource
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
     vtkImageSlice,
@@ -33,6 +40,7 @@ class ImageView(QWidget):
     path_clear_requested = Signal(str)
     slice_position_changed = Signal(str, float)
     maximize_requested = Signal(object)
+    window_level_adjust_requested = Signal(float, float)
 
     def __init__(self, orientation: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -40,6 +48,8 @@ class ImageView(QWidget):
         self._slice_axis = {"sagittal": 0, "coronal": 1, "axial": 2}[self.orientation]
         self._axes = orthogonal_plane_axes(self.orientation)
         self._normal = self._axes[2]
+        self._screen_right = -self._axes[0].copy()
+        self._screen_up = self._axes[1].copy()
         self._volume: LoadedVolume | None = None
         self._vtk_image = None
         self._crosshair_lps = np.zeros(3, dtype=float)
@@ -51,6 +61,10 @@ class ImageView(QWidget):
         self._drag_target: HitTarget | None = None
         self._dragged = False
         self._middle_last: QPoint | None = None
+        self._window_level_drag_start: tuple[QPoint, float, float] | None = None
+        self._window_level_adjustment_enabled = False
+        self._window = 1.0
+        self._level = 0.0
         self._suppress_next_release = False
 
         self.vtk_widget = QVTKRenderWindowInteractor(self)
@@ -62,7 +76,30 @@ class ImageView(QWidget):
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.vtk_widget)
+        controls = QHBoxLayout()
+        controls.setContentsMargins(4, 2, 4, 0)
+        controls.addStretch(1)
+        self.rotate_button = self._orientation_button(
+            "旋转 90°", "rotateClockwiseButton", self.rotate_clockwise
+        )
+        self.flip_horizontal_button = self._orientation_button(
+            "左右翻转", "flipHorizontalButton", self.flip_horizontal
+        )
+        self.flip_vertical_button = self._orientation_button(
+            "上下翻转", "flipVerticalButton", self.flip_vertical
+        )
+        self.reset_orientation_button = self._orientation_button(
+            "复位", "resetOrientationButton", self.reset_orientation
+        )
+        for button in (
+            self.rotate_button,
+            self.flip_horizontal_button,
+            self.flip_vertical_button,
+            self.reset_orientation_button,
+        ):
+            controls.addWidget(button)
+        layout.addLayout(controls)
+        layout.addWidget(self.vtk_widget, 1)
 
         self._slice_plane = vtkPlane()
         self._slice_plane.SetNormal(*self._normal)
@@ -84,6 +121,58 @@ class ImageView(QWidget):
         )
         self.vtk_widget.installEventFilter(self)
 
+    def _orientation_button(self, text: str, name: str, callback) -> QToolButton:
+        button = QToolButton(self)
+        button.setText(text)
+        button.setObjectName(name)
+        button.setAutoRaise(True)
+        button.clicked.connect(callback)
+        return button
+
+    def _apply_screen_axes(self, right, up, *, reset_camera: bool = False) -> None:
+        right = np.asarray(right, dtype=float)
+        up = np.asarray(up, dtype=float)
+        right /= np.linalg.norm(right)
+        up /= np.linalg.norm(up)
+        self._screen_right = right
+        self._screen_up = up
+
+        camera = self.renderer.GetActiveCamera()
+        direction = np.cross(up, right)
+        direction /= np.linalg.norm(direction)
+        if reset_camera:
+            focal = np.asarray(self._crosshair_lps, dtype=float)
+            distance = 500.0
+        else:
+            focal = np.asarray(camera.GetFocalPoint(), dtype=float)
+            distance = float(np.linalg.norm(
+                np.asarray(camera.GetPosition(), dtype=float) - focal
+            ))
+            if not np.isfinite(distance) or distance <= 0:
+                distance = 500.0
+        camera.SetFocalPoint(*focal)
+        camera.SetPosition(*(focal - direction * distance))
+        camera.SetViewUp(*up)
+        camera.OrthogonalizeViewUp()
+        camera.ParallelProjectionOn()
+        if reset_camera:
+            self.renderer.ResetCamera()
+        self.vtk_widget.update()
+
+    def rotate_clockwise(self) -> None:
+        right = self._screen_up.copy()
+        up = -self._screen_right.copy()
+        self._apply_screen_axes(right, up)
+
+    def flip_horizontal(self) -> None:
+        self._apply_screen_axes(-self._screen_right, self._screen_up)
+
+    def flip_vertical(self) -> None:
+        self._apply_screen_axes(self._screen_right, -self._screen_up)
+
+    def reset_orientation(self) -> None:
+        self._apply_screen_axes(-self._axes[0], self._axes[1])
+
     @property
     def crosshair_lps(self) -> tuple[float, float, float]:
         return tuple(float(value) for value in self._crosshair_lps)
@@ -104,12 +193,19 @@ class ImageView(QWidget):
         self,
         volume: LoadedVolume,
         crosshair_lps: Sequence[float] | None = None,
+        vtk_image=None,
     ) -> None:
         self._volume = volume
         self._axes = orthogonal_plane_axes(self.orientation) @ volume.geometry.direction_matrix.T
         self._normal = self._axes[2]
+        self._screen_right = -self._axes[0].copy()
+        self._screen_up = self._axes[1].copy()
         self._slice_plane.SetNormal(*self._normal)
-        self._vtk_image = loaded_volume_to_vtk(volume)
+        self._vtk_image = (
+            loaded_volume_to_vtk(volume)
+            if vtk_image is None
+            else vtk_image
+        )
         self._image_mapper.SetInputData(self._vtk_image)
         if crosshair_lps is None:
             center_index = np.asarray(volume.geometry.size_xyz, dtype=int) // 2
@@ -126,16 +222,11 @@ class ImageView(QWidget):
         self.vtk_widget.update()
 
     def _configure_camera(self) -> None:
-        camera = self.renderer.GetActiveCamera()
-        # Reverse the viewing side to mirror the horizontal screen axis only.
-        normal = -np.cross(self._axes[0], self._axes[1])
-        view_up = self._axes[1]
-        center = self._crosshair_lps
-        camera.SetFocalPoint(*center)
-        camera.SetPosition(*(center + normal * 500.0))
-        camera.SetViewUp(*view_up)
-        camera.ParallelProjectionOn()
-        self.renderer.ResetCamera()
+        self._apply_screen_axes(
+            self._screen_right,
+            self._screen_up,
+            reset_camera=True,
+        )
 
     def set_crosshair_lps(self, point_lps: Sequence[float]) -> None:
         point = np.asarray(point_lps, dtype=float)
@@ -171,10 +262,21 @@ class ImageView(QWidget):
         level = float(level)
         if not np.isfinite(window) or window <= 0 or not np.isfinite(level):
             raise ValueError("Window must be positive and window/level must be finite.")
+        self._window = window
+        self._level = level
         prop = self._image_actor.GetProperty()
         prop.SetColorWindow(window)
         prop.SetColorLevel(level)
         self.vtk_widget.update()
+
+    def set_window_level_adjustment_enabled(self, enabled: bool) -> None:
+        self._window_level_adjustment_enabled = bool(enabled)
+        self._middle_last = None
+        self._window_level_drag_start = None
+        if self._window_level_adjustment_enabled:
+            self.vtk_widget.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.vtk_widget.unsetCursor()
 
     def _slice_spacing_mm(self) -> float:
         if self._volume is None:
@@ -292,19 +394,22 @@ class ImageView(QWidget):
                 distance = abs(float(np.dot(self._normal, point)) - slice_position)
                 if distance > 1.5 * spacing:
                     continue
-                sphere = vtkSphereSource()
-                sphere.SetCenter(*point)
-                sphere.SetRadius(max(0.7, 0.65 * float(np.min(
-                    self._volume.geometry.spacing_xyz if self._volume else (1.0,)
-                ))))
-                sphere.SetThetaResolution(12)
-                sphere.SetPhiResolution(12)
+                marker_points = vtkPoints()
+                point_id = marker_points.InsertNextPoint(*point)
+                vertices = vtkCellArray()
+                vertices.InsertNextCell(1)
+                vertices.InsertCellPoint(point_id)
+                polydata = vtkPolyData()
+                polydata.SetPoints(marker_points)
+                polydata.SetVerts(vertices)
                 mapper = vtkPolyDataMapper()
-                mapper.SetInputConnection(sphere.GetOutputPort())
+                mapper.SetInputData(polydata)
                 actor = vtkActor()
                 actor.SetMapper(mapper)
                 color = (1.0, 0.75, 0.1) if active else (0.45, 0.7, 1.0)
                 actor.GetProperty().SetColor(*color)
+                actor.GetProperty().SetPointSize(12.0)
+                actor.GetProperty().RenderPointsAsSpheresOn()
                 actor.GetProperty().SetOpacity(
                     1.0 if distance <= 0.5 * spacing else 0.25
                 )
@@ -388,6 +493,19 @@ class ImageView(QWidget):
         self._middle_last = current
         self.vtk_widget.update()
 
+    def _adjust_window_level(self, event) -> None:
+        if self._window_level_drag_start is None:
+            return
+        start, initial_window, initial_level = self._window_level_drag_start
+        current = event.position().toPoint()
+        dx = float(current.x() - start.x())
+        dy = float(current.y() - start.y())
+        scale = 300.0
+        exponent = float(np.clip(-dx / scale, -10.0, 10.0))
+        window = max(0.001, initial_window * float(np.exp(exponent)))
+        level = initial_level + dy * initial_window / scale
+        self.window_level_adjust_requested.emit(window, level)
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is not self.vtk_widget:
             return super().eventFilter(watched, event)
@@ -401,7 +519,14 @@ class ImageView(QWidget):
         if event_type == QEvent.Type.MouseButtonPress:
             mouse: QMouseEvent = event
             if mouse.button() == Qt.MouseButton.MiddleButton:
-                self._middle_last = mouse.position().toPoint()
+                if self._window_level_adjustment_enabled:
+                    self._window_level_drag_start = (
+                        mouse.position().toPoint(),
+                        self._window,
+                        self._level,
+                    )
+                else:
+                    self._middle_last = mouse.position().toPoint()
                 return True
             target = self._pick(mouse)
             if mouse.button() == Qt.MouseButton.LeftButton:
@@ -433,12 +558,16 @@ class ImageView(QWidget):
             if self._middle_last is not None:
                 self._pan(mouse)
                 return True
+            if self._window_level_drag_start is not None:
+                self._adjust_window_level(mouse)
+                return True
             if mouse.buttons() & Qt.MouseButton.LeftButton:
                 return True
         if event_type == QEvent.Type.MouseButtonRelease:
             mouse = event
             if mouse.button() == Qt.MouseButton.MiddleButton:
                 self._middle_last = None
+                self._window_level_drag_start = None
                 return True
             if mouse.button() == Qt.MouseButton.LeftButton:
                 if self._drag_target is not None:

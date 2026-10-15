@@ -4,11 +4,14 @@ from collections.abc import Sequence
 
 import numpy as np
 from PySide6.QtCore import Signal
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QGridLayout, QWidget
+from vtkmodules.vtkCommonDataModel import vtkImageData
 
 from .image_io import LoadedVolume
 from .image_view import ImageView
 from .models import ControlPath
+from .vtk_utils import loaded_volume_to_vtk
 
 
 class TriPlanarViewer(QWidget):
@@ -16,6 +19,7 @@ class TriPlanarViewer(QWidget):
     point_move_requested = Signal(str, str, int, object)
     point_delete_requested = Signal(str, int)
     path_clear_requested = Signal(str)
+    window_level_adjust_requested = Signal(float, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -45,6 +49,14 @@ class TriPlanarViewer(QWidget):
             view.path_clear_requested.connect(self.path_clear_requested)
             view.slice_position_changed.connect(self._on_slice_position_changed)
             view.maximize_requested.connect(self.toggle_maximize)
+            view.window_level_adjust_requested.connect(
+                self.window_level_adjust_requested
+            )
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        for view in self.views.values():
+            view.vtk_widget.close()
+        super().closeEvent(event)
 
     @property
     def crosshair_lps(self) -> tuple[float, float, float]:
@@ -55,8 +67,11 @@ class TriPlanarViewer(QWidget):
         center_index = np.asarray(volume.geometry.size_xyz, dtype=int) // 2
         center = volume.geometry.continuous_index_xyz_to_lps(center_index)
         self._crosshair_lps = np.asarray(center, dtype=float)
+        vtk_image = loaded_volume_to_vtk(volume)
         for view in self.views.values():
-            view.set_volume(volume, center)
+            view_image = vtkImageData()
+            view_image.ShallowCopy(vtk_image)
+            view.set_volume(volume, center, vtk_image=view_image)
 
     def set_crosshair_lps(self, point_lps: Sequence[float]) -> None:
         point = np.asarray(point_lps, dtype=float)
@@ -77,6 +92,10 @@ class TriPlanarViewer(QWidget):
     def set_window_level(self, window: float, level: float) -> None:
         for view in self.views.values():
             view.set_window_level(window, level)
+
+    def set_window_level_adjustment_enabled(self, enabled: bool) -> None:
+        for view in self.views.values():
+            view.set_window_level_adjustment_enabled(enabled)
 
     def _on_slice_position_changed(self, orientation: str, position: float) -> None:
         if self._volume is None:

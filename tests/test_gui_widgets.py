@@ -17,8 +17,12 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QLabel,
     QMessageBox,
+    QToolBar,
+    QToolButton,
     QWidget,
 )
 
@@ -95,6 +99,272 @@ class TriPlanarViewerTests(unittest.TestCase):
         self.assertEqual(tuple(viewer.views.values()), original_views)
         self.assertTrue(all(not view.isHidden() for view in viewer.views.values()))
         self.assertTrue(np.allclose(viewer.crosshair_lps, expected))
+
+    def test_each_view_orientation_controls_transform_the_rendered_screen_axes(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        viewer.set_volume(self._volume())
+        button_names = (
+            ("rotate", "rotateClockwiseButton"),
+            ("horizontal", "flipHorizontalButton"),
+            ("vertical", "flipVerticalButton"),
+            ("reset", "resetOrientationButton"),
+        )
+        for orientation, candidate in viewer.views.items():
+            self.assertTrue(
+                all(
+                    candidate.findChild(QToolButton, object_name)
+                    for _, object_name in button_names
+                ),
+                f"{orientation} view needs all orientation controls",
+            )
+
+        view = viewer.views["axial"]
+        buttons = {
+            name: view.findChild(QToolButton, object_name)
+            for name, object_name in button_names
+        }
+
+        def screen_axes():
+            camera = view.renderer.GetActiveCamera()
+            up = np.asarray(camera.GetViewUp(), dtype=float)
+            up /= np.linalg.norm(up)
+            direction = np.asarray(camera.GetDirectionOfProjection(), dtype=float)
+            direction /= np.linalg.norm(direction)
+            right = np.cross(direction, up)
+            right /= np.linalg.norm(right)
+            return right, up
+
+        initial_right, initial_up = screen_axes()
+        buttons["rotate"].click()
+        rotated_right, rotated_up = screen_axes()
+        np.testing.assert_allclose(rotated_right, initial_up, atol=1e-6)
+        np.testing.assert_allclose(rotated_up, -initial_right, atol=1e-6)
+
+        buttons["horizontal"].click()
+        flipped_right, flipped_up = screen_axes()
+        np.testing.assert_allclose(flipped_right, -rotated_right, atol=1e-6)
+        np.testing.assert_allclose(flipped_up, rotated_up, atol=1e-6)
+
+        buttons["vertical"].click()
+        twice_flipped_right, twice_flipped_up = screen_axes()
+        np.testing.assert_allclose(twice_flipped_right, flipped_right, atol=1e-6)
+        np.testing.assert_allclose(twice_flipped_up, -flipped_up, atol=1e-6)
+
+        buttons["reset"].click()
+        reset_right, reset_up = screen_axes()
+        np.testing.assert_allclose(reset_right, initial_right, atol=1e-6)
+        np.testing.assert_allclose(reset_up, initial_up, atol=1e-6)
+        viewer.close()
+
+    def test_view_headers_do_not_show_anatomical_orientation_names(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        displayed_labels = {
+            label.text()
+            for view in viewer.views.values()
+            for label in view.findChildren(QLabel)
+        }
+
+        self.assertTrue(
+            displayed_labels.isdisjoint({"轴位", "冠状位", "矢状位"})
+        )
+        viewer.close()
+
+    def test_window_level_tool_uses_middle_drag_and_syncs_all_views(self):
+        from NarrowDetecter.gui.main_window import MainWindow
+
+        window = MainWindow()
+        window.resize(1200, 800)
+        window.show()
+        window.set_loaded_volume(self._volume())
+        self.app.processEvents()
+        button = window.findChild(QToolButton, "windowLevelToolButton")
+        self.assertIsNotNone(button, "The toolbar needs a window/level tool button")
+        toolbar = window.findChild(QToolBar)
+        self.assertEqual(toolbar.findChildren(QDoubleSpinBox), [])
+
+        button.click()
+        self.assertTrue(button.isChecked())
+        for view in window.viewer.views.values():
+            self.assertEqual(
+                view.vtk_widget.cursor().shape(), Qt.CursorShape.CrossCursor
+            )
+
+        axial = window.viewer.views["axial"]
+        widget = axial.vtk_widget
+        camera_before = np.asarray(
+            axial.renderer.GetActiveCamera().GetPosition(), dtype=float
+        )
+        before_window = axial._image_actor.GetProperty().GetColorWindow()
+        before_level = axial._image_actor.GetProperty().GetColorLevel()
+        center = QPoint(widget.width() // 2, widget.height() // 2)
+        QTest.mousePress(widget, Qt.MouseButton.MiddleButton, pos=center)
+        QTest.mouseMove(widget, center + QPoint(60, -60), delay=10)
+        QTest.mouseRelease(
+            widget,
+            Qt.MouseButton.MiddleButton,
+            pos=center + QPoint(60, -60),
+        )
+        self.app.processEvents()
+
+        updated = [
+            (
+                view._image_actor.GetProperty().GetColorWindow(),
+                view._image_actor.GetProperty().GetColorLevel(),
+            )
+            for view in window.viewer.views.values()
+        ]
+        self.assertTrue(all(np.allclose(values, updated[0]) for values in updated))
+        self.assertLess(updated[0][0], before_window)
+        self.assertLess(updated[0][1], before_level)
+        np.testing.assert_allclose(
+            axial.renderer.GetActiveCamera().GetPosition(), camera_before, atol=1e-6
+        )
+
+        button.click()
+        self.assertFalse(button.isChecked())
+        for view in window.viewer.views.values():
+            self.assertNotEqual(
+                view.vtk_widget.cursor().shape(), Qt.CursorShape.CrossCursor
+            )
+        window.close()
+
+    def test_loading_another_volume_exits_window_level_adjustment_mode(self):
+        from NarrowDetecter.gui.main_window import MainWindow
+
+        window = MainWindow()
+        volume = self._volume()
+        window.set_loaded_volume(volume)
+        button = window.findChild(QToolButton, "windowLevelToolButton")
+        button.click()
+        self.assertTrue(button.isChecked())
+
+        window.set_loaded_volume(volume)
+
+        self.assertFalse(button.isChecked())
+        for view in window.viewer.views.values():
+            self.assertNotEqual(
+                view.vtk_widget.cursor().shape(), Qt.CursorShape.CrossCursor
+            )
+        window.close()
+
+    def test_transformed_screen_positions_map_back_to_the_same_lps_point(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+        from NarrowDetecter.gui.vtk_utils import display_position_to_lps
+
+        viewer = TriPlanarViewer()
+        volume = self._volume()
+        viewer.resize(900, 700)
+        viewer.show()
+        viewer.set_volume(volume)
+        self.app.processEvents()
+        view = viewer.views["axial"]
+        expected = volume.geometry.continuous_index_xyz_to_lps((1.25, 4.25, 3.0))
+
+        operations = (
+            (view.rotate_clockwise,),
+            (view.flip_horizontal,),
+            (view.flip_vertical,),
+            (view.rotate_clockwise, view.flip_horizontal, view.flip_vertical),
+        )
+        for sequence in operations:
+            view.reset_orientation()
+            for operation in sequence:
+                operation()
+            view.renderer.SetWorldPoint(*expected, 1.0)
+            view.renderer.WorldToDisplay()
+            display_x, display_y, _ = view.renderer.GetDisplayPoint()
+            recovered = display_position_to_lps(
+                view.renderer,
+                (display_x, display_y),
+                view.crosshair_lps,
+                view._normal,
+            )
+            np.testing.assert_allclose(recovered, expected, atol=1e-6)
+            recovered_index = volume.geometry.lps_to_continuous_index_xyz(recovered)
+            self.assertAlmostEqual(recovered_index[2], 3.0, places=6)
+        viewer.close()
+
+    def test_view_orientation_is_independent_and_new_volume_resets_all_views(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        volume = self._volume()
+        viewer.set_volume(volume)
+
+        def screen_axes(view):
+            camera = view.renderer.GetActiveCamera()
+            up = np.asarray(camera.GetViewUp(), dtype=float)
+            up /= np.linalg.norm(up)
+            direction = np.asarray(camera.GetDirectionOfProjection(), dtype=float)
+            direction /= np.linalg.norm(direction)
+            right = np.cross(direction, up)
+            right /= np.linalg.norm(right)
+            return right, up
+
+        untouched_before = {
+            name: screen_axes(viewer.views[name])
+            for name in ("coronal", "sagittal")
+        }
+        viewer.views["axial"].rotate_clockwise()
+        for name, expected in untouched_before.items():
+            actual = screen_axes(viewer.views[name])
+            np.testing.assert_allclose(actual[0], expected[0], atol=1e-6)
+            np.testing.assert_allclose(actual[1], expected[1], atol=1e-6)
+
+        for view in viewer.views.values():
+            view.flip_horizontal()
+        viewer.set_volume(volume)
+        for view in viewer.views.values():
+            right, up = screen_axes(view)
+            np.testing.assert_allclose(right, -view._axes[0], atol=1e-6)
+            np.testing.assert_allclose(up, view._axes[1], atol=1e-6)
+        viewer.close()
+
+    @unittest.skipUnless(sys.platform == "win32", "Native VTK window test requires Windows")
+    def test_closing_main_window_finalizes_native_vtk_windows_first(self):
+        script = textwrap.dedent(
+            """
+            import numpy as np
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QApplication
+            from NarrowDetecter.gui.image_io import LoadedVolume
+            from NarrowDetecter.gui.main_window import MainWindow
+            from NarrowDetecter.gui.models import ImageGeometry
+
+            app = QApplication([])
+            geometry = ImageGeometry(
+                (12, 12, 12), (1.0, 1.0, 1.0), (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            )
+            volume = LoadedVolume(
+                np.arange(12 ** 3, dtype=np.float32).reshape(12, 12, 12),
+                None, geometry, "nifti", "synthetic",
+            )
+            window = MainWindow()
+            window.resize(900, 700)
+            window.show()
+            window.set_loaded_volume(volume)
+            QTimer.singleShot(300, window.close)
+            raise SystemExit(app.exec())
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            env=dict(os.environ, QT_QPA_PLATFORM="windows"),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output[-4000:])
+        self.assertNotIn("wglMakeCurrent failed", output, output[-4000:])
 
     @unittest.skipUnless(sys.platform == "win32", "Native VTK window test requires Windows")
     def test_loaded_volume_renders_in_all_three_native_views(self):
@@ -235,6 +505,8 @@ class TriPlanarViewerTests(unittest.TestCase):
             viewer.set_window_level(700.0, 2000.0)
             viewer.activateWindow()
             view = viewer.views["axial"]
+            view.rotate_clockwise()
+            view.flip_horizontal()
             widget = view.vtk_widget
             camera = view.renderer.GetActiveCamera()
 
@@ -470,6 +742,39 @@ class TriPlanarViewerTests(unittest.TestCase):
             self.assertAlmostEqual(index[axis], expected[axis])
         viewer.close()
 
+    def test_all_views_share_one_vtk_scalar_buffer(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        viewer.set_volume(self._volume())
+
+        vtk_images = tuple(view._vtk_image for view in viewer.views.values())
+        self.assertEqual(len({id(image) for image in vtk_images}), 3)
+        scalar_arrays = tuple(
+            image.GetPointData().GetScalars()
+            for image in vtk_images
+        )
+        self.assertEqual(len({id(scalars) for scalars in scalar_arrays}), 1)
+        viewer.close()
+
+    def test_control_point_marker_uses_a_fixed_screen_size(self):
+        from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
+
+        viewer = TriPlanarViewer()
+        volume = self._volume()
+        viewer.set_volume(volume)
+        center = viewer.crosshair_lps
+        path = ControlPath("active", "Active", [center])
+        viewer.set_paths((path,), path.path_id)
+
+        for view in viewer.views.values():
+            actors = tuple(view._point_actors)
+            self.assertEqual(len(actors), 1)
+            point_property = actors[0].GetProperty()
+            self.assertEqual(point_property.GetPointSize(), 12.0)
+            self.assertTrue(point_property.GetRenderPointsAsSpheres())
+        viewer.close()
+
     def test_crosshair_and_path_lines_are_rendered_and_inactive_points_are_hit_testable(self):
         from NarrowDetecter.gui.tri_planar_viewer import TriPlanarViewer
 
@@ -558,6 +863,36 @@ class ControlPanelTests(unittest.TestCase):
         panel.activate_path("two")
         self.assertEqual(activated, ["two"])
 
+    def test_path_context_menu_requests_deletion_for_the_clicked_row(self):
+        from NarrowDetecter.gui.path_panel import PathPanel
+
+        panel = PathPanel()
+        first = ControlPath("one", "First")
+        second = ControlPath("two", "Second")
+        panel.set_paths((first, second), "one")
+        panel.show()
+        self.app.processEvents()
+        deleted = []
+        activated = []
+        panel.delete_requested.connect(deleted.append)
+        panel.active_path_requested.connect(activated.append)
+        position = panel.tree.visualItemRect(panel._items["two"]).center()
+
+        panel.tree.customContextMenuRequested.emit(position)
+        self.app.processEvents()
+        menu = panel._context_menu
+        delete_action = menu.actions()[0]
+        QTest.mouseClick(
+            menu,
+            Qt.MouseButton.LeftButton,
+            pos=menu.actionGeometry(delete_action).center(),
+        )
+        self.app.processEvents()
+
+        self.assertEqual(deleted, ["two"])
+        self.assertEqual(activated, [])
+        panel.close()
+
     def test_cpr_panel_exposes_only_common_settings_with_twelve_defaults(self):
         from NarrowDetecter.gui.cpr_panel import CPRPanel
 
@@ -579,22 +914,29 @@ class _FakeViewer(QWidget):
     point_move_requested = Signal(str, str, int, object)
     point_delete_requested = Signal(str, int)
     path_clear_requested = Signal(str)
+    window_level_adjust_requested = Signal(float, float)
 
     def __init__(self):
         super().__init__()
         self.volume = None
         self.paths = ()
         self.active_path_id = None
+        self.events = []
 
     def set_volume(self, volume):
         self.volume = volume
+        self.events.append(("volume", volume.source_path))
 
     def set_paths(self, paths, active_path_id):
         self.paths = tuple(paths)
         self.active_path_id = active_path_id
+        self.events.append(("paths", len(self.paths), active_path_id))
 
     def set_window_level(self, window, level):
         self.window_level = (window, level)
+
+    def set_window_level_adjustment_enabled(self, enabled):
+        self.window_level_adjustment_enabled = bool(enabled)
 
     def set_crosshair_lps(self, point):
         self.crosshair_lps = tuple(point)
@@ -626,6 +968,64 @@ class MainWindowStateTests(unittest.TestCase):
             "axial", first.path_id, 0, (0.0, 0.0, original[2])
         )
         self.assertEqual(first.control_points_lps_mm[0], original)
+
+    def test_replacing_volume_clears_old_point_actors_before_loading(self):
+        window = self._window()
+        volume = TriPlanarViewerTests._volume()
+        window.set_loaded_volume(volume)
+        window.viewer.point_append_requested.emit(
+            "axial", volume.geometry.continuous_index_xyz_to_lps((2.0, 3.0, 3.0))
+        )
+        window.viewer.events.clear()
+
+        replacement = LoadedVolume(
+            array_zyx=volume.array_zyx.copy(),
+            image_itk=None,
+            geometry=volume.geometry,
+            source_kind="nifti",
+            source_path="replacement.nii.gz",
+        )
+        window.set_loaded_volume(replacement)
+
+        self.assertGreaterEqual(len(window.viewer.events), 2)
+        self.assertEqual(window.viewer.events[0], ("paths", 0, None))
+        self.assertEqual(window.viewer.events[1], ("volume", "replacement.nii.gz"))
+
+    def test_display_window_percentiles_use_a_bounded_sample(self):
+        from NarrowDetecter.gui import main_window as main_window_module
+
+        window = self._window()
+        geometry = ImageGeometry(
+            size_xyz=(200, 200, 50),
+            spacing_xyz=(1.0, 1.0, 1.0),
+            origin_lps_xyz=(0.0, 0.0, 0.0),
+            direction_xyz=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        )
+        volume = LoadedVolume(
+            array_zyx=np.linspace(0.0, 100.0, 2_000_000, dtype=np.float32).reshape(
+                50, 200, 200
+            ),
+            image_itk=None,
+            geometry=geometry,
+            source_kind="nifti",
+            source_path="large.nii.gz",
+        )
+        original_percentile = np.percentile
+        sample_sizes = []
+
+        def record_percentile(values, *args, **kwargs):
+            sample_sizes.append(np.asarray(values).size)
+            return original_percentile(values, *args, **kwargs)
+
+        with mock.patch.object(
+            main_window_module.np,
+            "percentile",
+            side_effect=record_percentile,
+        ):
+            window.set_loaded_volume(volume)
+
+        self.assertEqual(len(sample_sizes), 1)
+        self.assertLessEqual(sample_sizes[0], 1_000_000)
 
     def test_dragging_point_on_oblique_slice_preserves_array_layer(self):
         angle = np.deg2rad(20.0)
@@ -737,6 +1137,61 @@ class MainWindowStateTests(unittest.TestCase):
         self.assertFalse(window.acceptDrops())
         window._set_busy(False)
         self.assertTrue(window.acceptDrops())
+
+    def test_confirmed_path_deletion_removes_the_target_and_selects_neighbor(self):
+        window = self._window()
+        window.set_loaded_volume(TriPlanarViewerTests._volume())
+        first = window.path_store.active_path
+        second = window.create_path("Second")
+
+        with mock.patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            window.path_panel.delete_requested.emit(second.path_id)
+
+        self.assertEqual(
+            tuple(path.path_id for path in window.path_store.paths),
+            (first.path_id,),
+        )
+        self.assertEqual(window.path_store.active_path_id, first.path_id)
+        self.assertEqual(window.viewer.active_path_id, first.path_id)
+
+    def test_deleting_inactive_path_preserves_unsaved_active_panel_settings(self):
+        window = self._window()
+        window.set_loaded_volume(TriPlanarViewerTests._volume())
+        first = window.path_store.active_path
+        second = window.create_path("Second")
+        window.cpr_panel.mode.setCurrentIndex(
+            window.cpr_panel.mode.findData("straightened")
+        )
+
+        with mock.patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            window.path_panel.delete_requested.emit(first.path_id)
+
+        self.assertEqual(window.path_store.active_path_id, second.path_id)
+        self.assertEqual(window.cpr_panel.settings().mode, "straightened")
+
+    def test_completed_output_path_uses_bottom_status_without_resizing_panels(self):
+        window = self._window()
+        window.show()
+        self.app.processEvents()
+        before = tuple(window.splitter.sizes())
+        output = "E:\\" + "very-long-output-directory\\" * 20
+
+        window._worker_completed(output)
+        self.app.processEvents()
+
+        after = tuple(window.splitter.sizes())
+        self.assertEqual(window.cpr_panel.status_label.text(), "完成")
+        self.assertEqual(window.statusBar().currentMessage(), f"CPR 已完成：{output}")
+        self.assertEqual(after, before)
+        window.close()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QMenu,
     QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
@@ -20,12 +21,14 @@ class PathPanel(QWidget):
     active_path_requested = Signal(str)
     rename_requested = Signal(str, str)
     visibility_changed = Signal(str, bool)
+    delete_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._items: dict[str, QTreeWidgetItem] = {}
         self._names: dict[str, str] = {}
         self._active_path_id: str | None = None
+        self._context_menu: QMenu | None = None
 
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(2)
@@ -33,8 +36,10 @@ class PathPanel(QWidget):
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setColumnWidth(0, 48)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.itemClicked.connect(self._on_item_clicked)
         self.tree.itemChanged.connect(self._on_item_changed)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
 
         self.create_button = QPushButton("新建路径", self)
         self.create_button.clicked.connect(self.create_requested)
@@ -100,6 +105,25 @@ class PathPanel(QWidget):
             if name and name != self._names.get(path_id):
                 self._names[path_id] = name
                 self.rename_requested.emit(path_id, name)
+
+    def _show_context_menu(self, position) -> None:
+        item = self.tree.itemAt(position)
+        if item is None:
+            return
+        path_id = self._path_id(item)
+        self._context_menu = QMenu(self.tree)
+        delete_action = self._context_menu.addAction("删除路径")
+        delete_action.triggered.connect(
+            lambda checked=False, target=path_id: self.delete_requested.emit(target)
+        )
+        menu = self._context_menu
+        menu.aboutToHide.connect(lambda: self._clear_context_menu(menu))
+        self._context_menu.popup(self.tree.viewport().mapToGlobal(position))
+
+    def _clear_context_menu(self, menu: QMenu) -> None:
+        if self._context_menu is menu:
+            self._context_menu = None
+        menu.deleteLater()
 
     def set_path_visibility(self, path_id: str, visible: bool) -> None:
         item = self._items[path_id]
